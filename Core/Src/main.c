@@ -40,25 +40,30 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define APP_BUTTON_X               350U
-#define APP_BUTTON_Y                80U
-#define APP_BUTTON_WIDTH           110U
-#define APP_BUTTON_HEIGHT           90U
 
-#define APP_RECORD_X                10U
-#define APP_RECORD_Y                56U
-#define APP_RECORD_WIDTH           315U
-#define APP_RECORD_HEIGHT          200U
-#define APP_RECORD_LINE_HEIGHT      24U
+#define APP_SEPARATOR_X              280U
 
-#define APP_MAX_RECORDS              8U
-#define APP_RECORD_TEXT_LENGTH      48U
+#define APP_MILK_BUTTON_WIDTH         84U
+#define APP_MILK_BUTTON_HEIGHT        52U
 
-#define APP_TOUCH_DEBOUNCE_MS      200U
+#define APP_MILK_BUTTON_X1           290U
+#define APP_MILK_BUTTON_X2           386U
 
-#define RTC_INIT_MAGIC 0x32F2U
+#define APP_MILK_BUTTON_Y1            30U
+#define APP_MILK_BUTTON_Y2           105U
+#define APP_MILK_BUTTON_Y3           180U
 
-#define RTC_INIT_MAGIC       0x32F3U
+#define APP_RECORD_X                  10U
+#define APP_RECORD_Y                  76U
+#define APP_RECORD_WIDTH             260U
+#define APP_RECORD_HEIGHT            185U
+#define APP_RECORD_LINE_HEIGHT        22U
+
+#define APP_MAX_RECORDS                8U
+#define APP_RECORD_TEXT_LENGTH        32U
+#define APP_TOUCH_DEBOUNCE_MS        200U
+
+#define RTC_INIT_MAGIC             0x32F3U
 
 #define SET_MINUS_X          10U
 #define SET_PLUS_X           125U
@@ -141,14 +146,102 @@ osThreadId defaultTaskHandle;
 
 static TS_StateTypeDef appTouchState;
 
-static char appPressRecords
-    [APP_MAX_RECORDS]
-    [APP_RECORD_TEXT_LENGTH];
+typedef struct
+{
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+    uint16_t amountMl;
+    const char *label;
+} APP_MilkButtonTypeDef;
+
+
+typedef struct
+{
+    uint16_t year;
+
+    uint8_t month;
+    uint8_t day;
+
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+
+    uint16_t amountMl;
+} APP_MilkRecordTypeDef;
+
+
+/*
+ * 右侧六个按钮。
+ */
+static const APP_MilkButtonTypeDef appMilkButtons[] =
+{
+    {
+        APP_MILK_BUTTON_X1,
+        APP_MILK_BUTTON_Y1,
+        APP_MILK_BUTTON_WIDTH,
+        APP_MILK_BUTTON_HEIGHT,
+        30U,
+        "30ml"
+    },
+    {
+        APP_MILK_BUTTON_X2,
+        APP_MILK_BUTTON_Y1,
+        APP_MILK_BUTTON_WIDTH,
+        APP_MILK_BUTTON_HEIGHT,
+        50U,
+        "50ml"
+    },
+    {
+        APP_MILK_BUTTON_X1,
+        APP_MILK_BUTTON_Y2,
+        APP_MILK_BUTTON_WIDTH,
+        APP_MILK_BUTTON_HEIGHT,
+        90U,
+        "90ml"
+    },
+    {
+        APP_MILK_BUTTON_X2,
+        APP_MILK_BUTTON_Y2,
+        APP_MILK_BUTTON_WIDTH,
+        APP_MILK_BUTTON_HEIGHT,
+        100U,
+        "100ml"
+    },
+    {
+        APP_MILK_BUTTON_X1,
+        APP_MILK_BUTTON_Y3,
+        APP_MILK_BUTTON_WIDTH,
+        APP_MILK_BUTTON_HEIGHT,
+        110U,
+        "110ml"
+    },
+    {
+        APP_MILK_BUTTON_X2,
+        APP_MILK_BUTTON_Y3,
+        APP_MILK_BUTTON_WIDTH,
+        APP_MILK_BUTTON_HEIGHT,
+        120U,
+        "120ml"
+    }
+};
+
+#define APP_MILK_BUTTON_COUNT \
+    ((uint8_t)(sizeof(appMilkButtons) / sizeof(appMilkButtons[0])))
+
+
+static APP_MilkRecordTypeDef appMilkRecords[APP_MAX_RECORDS];
 
 static uint8_t appRecordCount = 0U;
-static uint32_t appTotalPressCount = 0U;
+static uint32_t appTodayTotalMl = 0U;
+
+static uint16_t appTodayYear = 0U;
+static uint8_t appTodayMonth = 0U;
+static uint8_t appTodayDay = 0U;
 
 static uint32_t appLastPressTick = 0U;
+
 
 typedef enum
 {
@@ -206,25 +299,19 @@ void StartDefaultTask(void const * argument);
 
 static void APP_Init(void);
 static void APP_Run(void);
+
 static void APP_DrawInterface(void);
-static void APP_DrawButton(uint8_t pressed);
-static void APP_RedrawRecords(void);
-static void APP_AddRecord(void);
+static void APP_DrawLeftPanel(void);
+
+static void APP_DrawMilkButton(
+    uint8_t buttonIndex,
+    uint8_t pressed);
+
+static void APP_DrawAllMilkButtons(void);
+
+static void APP_InitTodayState(void);
+static void APP_AddMilkRecord(uint16_t amountMl);
 static void APP_ProcessTouch(void);
-static uint8_t APP_IsInsideButton(uint16_t x, uint16_t y);
-
-static void APP_TimeSetupScreen(void);
-static void APP_DrawTimeSetupScreen(void);
-static void APP_DrawSetupButton(
-    uint16_t x,
-    uint16_t y,
-    uint16_t width,
-    uint16_t height,
-    const char *text);
-
-static void APP_AdjustTime(int8_t direction);
-static HAL_StatusTypeDef APP_SaveRtcTime(void);
-static void APP_LoadRtcTime(void);
 
 static uint8_t APP_PointInRect(
     uint16_t touchX,
@@ -383,6 +470,38 @@ static void APP_LoadRtcTime(void)
     setupHour = 0U;
     setupMinute = 0U;
     setupSecond = 0U;
+}
+
+static void APP_InitTodayState(void)
+{
+    RTC_TimeTypeDef rtcTime = {0};
+    RTC_DateTypeDef rtcDate = {0};
+
+    /*
+     * STM32 RTC 必须先读时间，再读日期。
+     */
+    if (HAL_RTC_GetTime(
+            &hrtc,
+            &rtcTime,
+            RTC_FORMAT_BIN) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_RTC_GetDate(
+            &hrtc,
+            &rtcDate,
+            RTC_FORMAT_BIN) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    appTodayYear = 2000U + rtcDate.Year;
+    appTodayMonth = rtcDate.Month;
+    appTodayDay = rtcDate.Date;
+
+    appTodayTotalMl = 0U;
+    appRecordCount = 0U;
 }
 
 
@@ -870,7 +989,7 @@ static void APP_Init(void)
  * 每次开机先进入时间设置页面。
  */
 APP_TimeSetupScreen();
-
+APP_InitTodayState();
 /*
  * 保存时间后进入按钮记录页面。
  */
@@ -894,137 +1013,195 @@ static void APP_Run(void)
     }
 }
 
-
 static void APP_DrawInterface(void)
 {
     BSP_LCD_Clear(LCD_COLOR_WHITE);
 
     /*
-     * 左侧标题。
-     */
-    BSP_LCD_SetFont(&Font16);
-    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
-    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
-
-    BSP_LCD_DisplayStringAt(
-        10U,
-        10U,
-        (uint8_t *)"Button press records:",
-        LEFT_MODE
-    );
-
-    BSP_LCD_DisplayStringAt(
-        10U,
-        34U,
-        (uint8_t *)"No.  YYYY-MM-DD HH:MM:SS",
-        LEFT_MODE
-    );
-
-    /*
-     * 左右区域分隔线。
+     * 左右分隔线。
      */
     BSP_LCD_SetTextColor(LCD_COLOR_GRAY);
 
     BSP_LCD_DrawVLine(
-        337U,
-        8U,
-        255U
+        APP_SEPARATOR_X,
+        5U,
+        BSP_LCD_GetYSize() - 10U
     );
 
-    APP_DrawButton(0U);
-    APP_RedrawRecords();
+    APP_DrawLeftPanel();
+    APP_DrawAllMilkButtons();
 }
 
-
-static void APP_DrawButton(uint8_t pressed)
+static void APP_DrawLeftPanel(void)
 {
-    uint32_t buttonColor;
-
-    if (pressed != 0U)
-    {
-        buttonColor = LCD_COLOR_DARKBLUE;
-    }
-    else
-    {
-        buttonColor = LCD_COLOR_BLUE;
-    }
+    char text[40];
+    uint8_t i;
 
     /*
-     * 填充按钮。
+     * 清除整个左侧区域。
      */
-    BSP_LCD_SetTextColor(buttonColor);
-
-    BSP_LCD_FillRect(
-        APP_BUTTON_X,
-        APP_BUTTON_Y,
-        APP_BUTTON_WIDTH,
-        APP_BUTTON_HEIGHT
-    );
-
-    /*
-     * 绘制按钮边框。
-     */
-    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
-
-    BSP_LCD_DrawRect(
-        APP_BUTTON_X,
-        APP_BUTTON_Y,
-        APP_BUTTON_WIDTH,
-        APP_BUTTON_HEIGHT
-    );
-
-    /*
-     * 显示按钮文字。
-     */
-    BSP_LCD_SetFont(&Font20);
-    BSP_LCD_SetBackColor(buttonColor);
     BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
 
-    BSP_LCD_DisplayStringAt(
-        APP_BUTTON_X + 24U,
-        APP_BUTTON_Y + 34U,
-        (uint8_t *)"PRESS",
-        LEFT_MODE
+    BSP_LCD_FillRect(
+        0U,
+        0U,
+        APP_SEPARATOR_X - 2U,
+        BSP_LCD_GetYSize()
     );
 
-    /*
-     * 恢复文字设置。
-     */
     BSP_LCD_SetFont(&Font16);
     BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
     BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+
+    snprintf(
+        text,
+        sizeof(text),
+        "Date: %04u-%02u-%02u",
+        appTodayYear,
+        appTodayMonth,
+        appTodayDay
+    );
+
+    BSP_LCD_DisplayStringAt(
+        APP_RECORD_X,
+        8U,
+        (uint8_t *)text,
+        LEFT_MODE
+    );
+
+    snprintf(
+        text,
+        sizeof(text),
+        "Total: %lu ml",
+        (unsigned long)appTodayTotalMl
+    );
+
+    BSP_LCD_DisplayStringAt(
+        APP_RECORD_X,
+        32U,
+        (uint8_t *)text,
+        LEFT_MODE
+    );
+
+    BSP_LCD_DisplayStringAt(
+        APP_RECORD_X,
+        55U,
+        (uint8_t *)"Time        Amount",
+        LEFT_MODE
+    );
+
+    for (i = 0U; i < appRecordCount; i++)
+    {
+        snprintf(
+            text,
+            sizeof(text),
+            "%02u:%02u:%02u   %3u ml",
+            appMilkRecords[i].hour,
+            appMilkRecords[i].minute,
+            appMilkRecords[i].second,
+            appMilkRecords[i].amountMl
+        );
+
+        BSP_LCD_DisplayStringAt(
+            APP_RECORD_X,
+            APP_RECORD_Y +
+                ((uint16_t)i *
+                 APP_RECORD_LINE_HEIGHT),
+            (uint8_t *)text,
+            LEFT_MODE
+        );
+    }
 }
 
-
-static uint8_t APP_IsInsideButton(
-    uint16_t x,
-    uint16_t y)
+static void APP_DrawMilkButton(
+    uint8_t buttonIndex,
+    uint8_t pressed)
 {
-    if ((x >= APP_BUTTON_X) &&
-        (x < (APP_BUTTON_X + APP_BUTTON_WIDTH)) &&
-        (y >= APP_BUTTON_Y) &&
-        (y < (APP_BUTTON_Y + APP_BUTTON_HEIGHT)))
+    const APP_MilkButtonTypeDef *button;
+    uint32_t backgroundColor;
+
+    uint16_t textWidth;
+    uint16_t textX;
+    uint16_t textY;
+
+    if (buttonIndex >= APP_MILK_BUTTON_COUNT)
     {
-        return 1U;
+        return;
     }
 
-    return 0U;
+    button = &appMilkButtons[buttonIndex];
+
+    backgroundColor =
+        (pressed != 0U) ?
+        LCD_COLOR_DARKBLUE :
+        LCD_COLOR_BLUE;
+
+    BSP_LCD_SetTextColor(backgroundColor);
+
+    BSP_LCD_FillRect(
+        button->x,
+        button->y,
+        button->width,
+        button->height
+    );
+
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+
+    BSP_LCD_DrawRect(
+        button->x,
+        button->y,
+        button->width,
+        button->height
+    );
+
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(backgroundColor);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+
+    textWidth =
+        (uint16_t)(strlen(button->label) *
+                   Font16.Width);
+
+    textX =
+        button->x +
+        ((button->width - textWidth) / 2U);
+
+    textY =
+        button->y +
+        ((button->height - Font16.Height) / 2U);
+
+    BSP_LCD_DisplayStringAt(
+        textX,
+        textY,
+        (uint8_t *)button->label,
+        LEFT_MODE
+    );
 }
 
-static void APP_AddRecord(void)
+
+static void APP_DrawAllMilkButtons(void)
+{
+    uint8_t i;
+
+    for (i = 0U;
+         i < APP_MILK_BUTTON_COUNT;
+         i++)
+    {
+        APP_DrawMilkButton(i, 0U);
+    }
+}
+
+
+
+
+static void APP_AddMilkRecord(uint16_t amountMl)
 {
     RTC_TimeTypeDef rtcTime = {0};
     RTC_DateTypeDef rtcDate = {0};
 
+    uint16_t currentYear;
     uint8_t recordIndex;
-    uint32_t fullYear;
 
-    /*
-     * 必须先读取时间，再读取日期。
-     *
-     * 读取时间后，RTC 的日历影子寄存器会锁定；
-     * 读取日期后才会解锁。
-     */
     if (HAL_RTC_GetTime(
             &hrtc,
             &rtcTime,
@@ -1041,9 +1218,24 @@ static void APP_AddRecord(void)
         return;
     }
 
-    fullYear = 2000U + rtcDate.Year;
+    currentYear = 2000U + rtcDate.Year;
 
-    appTotalPressCount++;
+    /*
+     * 检测日期是否已经改变。
+     */
+    if ((currentYear != appTodayYear) ||
+        (rtcDate.Month != appTodayMonth) ||
+        (rtcDate.Date != appTodayDay))
+    {
+        appTodayYear = currentYear;
+        appTodayMonth = rtcDate.Month;
+        appTodayDay = rtcDate.Date;
+
+        appTodayTotalMl = 0U;
+        appRecordCount = 0U;
+    }
+
+    appTodayTotalMl += amountMl;
 
     if (appRecordCount < APP_MAX_RECORDS)
     {
@@ -1053,101 +1245,67 @@ static void APP_AddRecord(void)
     else
     {
         /*
-         * 记录区域已满：
-         * 删除最早的一条记录。
+         * 左侧只保留最近 8 条。
          */
         memmove(
-            appPressRecords[0],
-            appPressRecords[1],
-            (APP_MAX_RECORDS - 1U) *
-                APP_RECORD_TEXT_LENGTH
+            &appMilkRecords[0],
+            &appMilkRecords[1],
+            sizeof(appMilkRecords[0]) *
+                (APP_MAX_RECORDS - 1U)
         );
 
         recordIndex = APP_MAX_RECORDS - 1U;
     }
 
-    snprintf(
-        appPressRecords[recordIndex],
-        APP_RECORD_TEXT_LENGTH,
-        "%03lu  %04lu-%02u-%02u %02u:%02u:%02u",
-        (unsigned long)appTotalPressCount,
-        (unsigned long)fullYear,
-        (unsigned int)rtcDate.Month,
-        (unsigned int)rtcDate.Date,
-        (unsigned int)rtcTime.Hours,
-        (unsigned int)rtcTime.Minutes,
-        (unsigned int)rtcTime.Seconds
-    );
+    appMilkRecords[recordIndex].year =
+        currentYear;
 
-    APP_RedrawRecords();
-}
+    appMilkRecords[recordIndex].month =
+        rtcDate.Month;
 
+    appMilkRecords[recordIndex].day =
+        rtcDate.Date;
 
-static void APP_RedrawRecords(void)
-{
-    uint8_t i;
+    appMilkRecords[recordIndex].hour =
+        rtcTime.Hours;
 
-    /*
-     * 清除左侧记录区域。
-     */
-    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    appMilkRecords[recordIndex].minute =
+        rtcTime.Minutes;
 
-    BSP_LCD_FillRect(
-        APP_RECORD_X,
-        APP_RECORD_Y,
-        APP_RECORD_WIDTH,
-        APP_RECORD_HEIGHT
-    );
+    appMilkRecords[recordIndex].second =
+        rtcTime.Seconds;
 
-    BSP_LCD_SetFont(&Font16);
-    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
-    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    appMilkRecords[recordIndex].amountMl =
+        amountMl;
 
-    for (i = 0U; i < appRecordCount; i++)
-    {
-        BSP_LCD_DisplayStringAt(
-            APP_RECORD_X,
-            APP_RECORD_Y +
-                ((uint16_t)i *
-                 APP_RECORD_LINE_HEIGHT),
-            (uint8_t *)appPressRecords[i],
-            LEFT_MODE
-        );
-    }
+    APP_DrawLeftPanel();
 }
 
 
 static void APP_ProcessTouch(void)
 {
     static uint8_t previousTouching = 0U;
+    static int8_t activeButtonIndex = -1;
 
     uint8_t touching;
+    uint8_t i;
+
     uint16_t touchX;
     uint16_t touchY;
+
     uint32_t currentTick;
 
-    /*
-     * 读取触摸屏状态。
-     */
     if (BSP_TS_GetState(&appTouchState) != TS_OK)
     {
         return;
     }
 
-    if (appTouchState.touchDetected > 0U)
-    {
-        touching = 1U;
-    }
-    else
-    {
-        touching = 0U;
-    }
+    touching =
+        (appTouchState.touchDetected > 0U) ?
+        1U : 0U;
 
     /*
-     * 只处理触摸按下沿：
-     *
-     * 上一次没有触摸，
-     * 这一次检测到触摸。
+     * 刚刚按下。
      */
     if ((touching != 0U) &&
         (previousTouching == 0U))
@@ -1155,40 +1313,53 @@ static void APP_ProcessTouch(void)
         touchX = appTouchState.touchX[0];
         touchY = appTouchState.touchY[0];
 
-        if (APP_IsInsideButton(
-                touchX,
-                touchY) != 0U)
+        currentTick = HAL_GetTick();
+
+        if ((currentTick - appLastPressTick) >=
+            APP_TOUCH_DEBOUNCE_MS)
         {
-            currentTick = HAL_GetTick();
-
-            /*
-             * 软件防抖。
-             */
-            if ((currentTick - appLastPressTick) >=
-                APP_TOUCH_DEBOUNCE_MS)
+            for (i = 0U;
+                 i < APP_MILK_BUTTON_COUNT;
+                 i++)
             {
-                appLastPressTick = currentTick;
+                if (APP_PointInRect(
+                        touchX,
+                        touchY,
+                        appMilkButtons[i].x,
+                        appMilkButtons[i].y,
+                        appMilkButtons[i].width,
+                        appMilkButtons[i].height) != 0U)
+                {
+                    appLastPressTick = currentTick;
+                    activeButtonIndex = (int8_t)i;
 
-                /*
-                 * 显示按下状态。
-                 */
-                APP_DrawButton(1U);
+                    APP_DrawMilkButton(i, 1U);
 
-                /*
-                 * 添加当前时间记录。
-                 */
-                APP_AddRecord();
+                    APP_AddMilkRecord(
+                        appMilkButtons[i].amountMl
+                    );
+
+                    break;
+                }
             }
         }
     }
 
     /*
-     * 手指松开后恢复按钮颜色。
+     * 手指松开。
      */
     if ((touching == 0U) &&
         (previousTouching != 0U))
     {
-        APP_DrawButton(0U);
+        if (activeButtonIndex >= 0)
+        {
+            APP_DrawMilkButton(
+                (uint8_t)activeButtonIndex,
+                0U
+            );
+
+            activeButtonIndex = -1;
+        }
     }
 
     previousTouching = touching;
