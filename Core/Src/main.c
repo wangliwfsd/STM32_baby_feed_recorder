@@ -64,9 +64,15 @@
 #define APP_RECORD_HEIGHT            185U
 #define APP_RECORD_LINE_HEIGHT        22U
 
-#define APP_MAX_RECORDS                8U
+#define APP_HISTORY_MAX_RECORDS      256U
+#define APP_RECORDS_PER_PAGE           8U
 #define APP_RECORD_TEXT_LENGTH        32U
 #define APP_TOUCH_DEBOUNCE_MS        200U
+#define APP_HISTORY_SWIPE_PIXELS       35U
+#define APP_DELETE_X                  290U
+#define APP_DELETE_Y                  240U
+#define APP_DELETE_WIDTH              180U
+#define APP_DELETE_HEIGHT              28U
 
 #define RTC_INIT_MAGIC             0x32F3U
 
@@ -174,6 +180,7 @@ typedef struct
     uint8_t second;
 
     uint16_t amountMl;
+    uint32_t sourceOrdinal;
 } APP_MilkRecordTypeDef;
 
 
@@ -236,9 +243,12 @@ static const APP_MilkButtonTypeDef appMilkButtons[] =
     ((uint8_t)(sizeof(appMilkButtons) / sizeof(appMilkButtons[0])))
 
 
-static APP_MilkRecordTypeDef appMilkRecords[APP_MAX_RECORDS];
+static APP_MilkRecordTypeDef appMilkRecords[APP_HISTORY_MAX_RECORDS];
 
-static uint8_t appRecordCount = 0U;
+static uint16_t appRecordCount = 0U;
+static uint16_t appHistoryPage = 0U;
+static int16_t appSelectedRecordIndex = -1;
+static uint32_t appCsvRecordCount = 0U;
 static uint32_t appTodayTotalMl = 0U;
 
 static uint16_t appTodayYear = 0U;
@@ -330,6 +340,8 @@ static void APP_AddMilkRecord(uint16_t amountMl);
 static FRESULT APP_AppendMilkRecord(const APP_MilkRecordTypeDef *record);
 static FRESULT APP_LoadTodayRecords(void);
 static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record);
+static FRESULT APP_DeleteRecord(uint32_t sourceOrdinal);
+static void APP_DrawDeleteButton(void);
 static void APP_ProcessTouch(void);
 
 static uint8_t APP_PointInRect(
@@ -524,6 +536,9 @@ static void APP_InitTodayState(void)
 
     appTodayTotalMl = 0U;
     appRecordCount = 0U;
+    appHistoryPage = 0U;
+    appSelectedRecordIndex = -1;
+    appCsvRecordCount = 0U;
 }
 
 
@@ -1075,12 +1090,16 @@ static void APP_DrawInterface(void)
 
     APP_DrawLeftPanel();
     APP_DrawAllMilkButtons();
+    APP_DrawDeleteButton();
 }
 
 static void APP_DrawLeftPanel(void)
 {
     char text[40];
-    uint8_t i;
+    uint16_t i;
+    uint16_t firstIndex;
+    uint16_t endIndex;
+    uint16_t totalPages;
 
     /*
      * 清除整个左侧区域。
@@ -1128,34 +1147,68 @@ static void APP_DrawLeftPanel(void)
         LEFT_MODE
     );
 
-    BSP_LCD_DisplayStringAt(
-        APP_RECORD_X,
-        55U,
-        (uint8_t *)"Time        Amount",
-        LEFT_MODE
-    );
-
-    for (i = 0U; i < appRecordCount; i++)
+    totalPages = (appRecordCount == 0U) ? 1U :
+        (uint16_t)((appRecordCount + APP_RECORDS_PER_PAGE - 1U) /
+                   APP_RECORDS_PER_PAGE);
+    if (appHistoryPage >= totalPages)
     {
+        appHistoryPage = totalPages - 1U;
+    }
+
+    snprintf(text, sizeof(text), "History  Page %u/%u",
+             (unsigned int)(appHistoryPage + 1U),
+             (unsigned int)totalPages);
+    BSP_LCD_DisplayStringAt(APP_RECORD_X, 55U, (uint8_t *)text, LEFT_MODE);
+
+    endIndex = appRecordCount -
+        (uint16_t)(appHistoryPage * APP_RECORDS_PER_PAGE);
+    firstIndex = (endIndex > APP_RECORDS_PER_PAGE) ?
+        (uint16_t)(endIndex - APP_RECORDS_PER_PAGE) : 0U;
+
+    for (i = 0U; i < (endIndex - firstIndex); i++)
+    {
+        uint16_t recordIndex = (uint16_t)(endIndex - 1U - i);
+
+        BSP_LCD_SetBackColor(
+            ((int16_t)recordIndex == appSelectedRecordIndex) ?
+            LCD_COLOR_YELLOW : LCD_COLOR_WHITE);
         snprintf(
             text,
             sizeof(text),
-            "%02u:%02u:%02u   %3u ml",
-            appMilkRecords[i].hour,
-            appMilkRecords[i].minute,
-            appMilkRecords[i].second,
-            appMilkRecords[i].amountMl
+            "%02u-%02u %02u:%02u  %3u ml",
+            appMilkRecords[recordIndex].month,
+            appMilkRecords[recordIndex].day,
+            appMilkRecords[recordIndex].hour,
+            appMilkRecords[recordIndex].minute,
+            appMilkRecords[recordIndex].amountMl
         );
 
         BSP_LCD_DisplayStringAt(
             APP_RECORD_X,
             APP_RECORD_Y +
-                ((uint16_t)i *
+                (i *
                  APP_RECORD_LINE_HEIGHT),
             (uint8_t *)text,
             LEFT_MODE
         );
     }
+
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+}
+
+static void APP_DrawDeleteButton(void)
+{
+    uint32_t color = (appSelectedRecordIndex >= 0) ?
+        LCD_COLOR_RED : LCD_COLOR_GRAY;
+
+    BSP_LCD_SetTextColor(color);
+    BSP_LCD_FillRect(APP_DELETE_X, APP_DELETE_Y,
+                     APP_DELETE_WIDTH, APP_DELETE_HEIGHT);
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(color);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_DisplayStringAt(APP_DELETE_X + 57U, APP_DELETE_Y + 5U,
+                            (uint8_t *)"DELETE", LEFT_MODE);
 }
 
 static void APP_DrawMilkButton(
@@ -1277,7 +1330,7 @@ static void APP_AddMilkRecord(uint16_t amountMl)
         appTodayDay = rtcDate.Date;
 
         appTodayTotalMl = 0U;
-        appRecordCount = 0U;
+        appHistoryPage = 0U;
     }
 
     record.year = currentYear;
@@ -1294,26 +1347,34 @@ static void APP_AddMilkRecord(uint16_t amountMl)
         return;
     }
 
+    record.sourceOrdinal = ++appCsvRecordCount;
     APP_InsertTodayRecord(&record);
+    appHistoryPage = 0U;
 
     APP_DrawLeftPanel();
 }
 
 static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record)
 {
-    uint8_t recordIndex;
+    uint16_t recordIndex;
 
-    appTodayTotalMl += record->amountMl;
+    if ((record->year == appTodayYear) &&
+        (record->month == appTodayMonth) &&
+        (record->day == appTodayDay))
+    {
+        appTodayTotalMl += record->amountMl;
+    }
 
-    if (appRecordCount < APP_MAX_RECORDS)
+    if (appRecordCount < APP_HISTORY_MAX_RECORDS)
     {
         recordIndex = appRecordCount++;
     }
     else
     {
         memmove(&appMilkRecords[0], &appMilkRecords[1],
-                sizeof(appMilkRecords[0]) * (APP_MAX_RECORDS - 1U));
-        recordIndex = APP_MAX_RECORDS - 1U;
+                sizeof(appMilkRecords[0]) *
+                    (APP_HISTORY_MAX_RECORDS - 1U));
+        recordIndex = APP_HISTORY_MAX_RECORDS - 1U;
     }
 
     appMilkRecords[recordIndex] = *record;
@@ -1380,6 +1441,8 @@ static FRESULT APP_LoadTodayRecords(void)
         return result;
     }
 
+    appCsvRecordCount = 0U;
+
     while (f_gets(line, sizeof(line), &file) != NULL)
     {
         APP_MilkRecordTypeDef record;
@@ -1392,8 +1455,8 @@ static FRESULT APP_LoadTodayRecords(void)
             continue;
         }
 
-        if ((year != appTodayYear) || (month != appTodayMonth) ||
-            (day != appTodayDay) || (hour > 23U) || (minute > 59U) ||
+        if ((month < 1U) || (month > 12U) || (day < 1U) ||
+            (day > 31U) || (hour > 23U) || (minute > 59U) ||
             (second > 59U) || (amount > 65535U))
         {
             continue;
@@ -1406,6 +1469,7 @@ static FRESULT APP_LoadTodayRecords(void)
         record.minute = (uint8_t)minute;
         record.second = (uint8_t)second;
         record.amountMl = (uint16_t)amount;
+        record.sourceOrdinal = ++appCsvRecordCount;
         APP_InsertTodayRecord(&record);
     }
 
@@ -1420,11 +1484,103 @@ static FRESULT APP_LoadTodayRecords(void)
     return result;
 }
 
+static FRESULT APP_DeleteRecord(uint32_t sourceOrdinal)
+{
+    FIL source;
+    FIL temp;
+    FRESULT result;
+    char line[64];
+    char tempPath[24];
+    char backupPath[24];
+    uint32_t ordinal = 0U;
+
+    snprintf(tempPath, sizeof(tempPath), "%sMILKTMP.CSV", SDPath);
+    snprintf(backupPath, sizeof(backupPath), "%sMILKBAK.CSV", SDPath);
+    (void)f_unlink(tempPath);
+    (void)f_unlink(backupPath);
+
+    result = f_open(&source, appSdFilePath, FA_READ);
+    if (result != FR_OK)
+    {
+        return result;
+    }
+    result = f_open(&temp, tempPath, FA_CREATE_ALWAYS | FA_WRITE);
+    if (result != FR_OK)
+    {
+        (void)f_close(&source);
+        return result;
+    }
+
+    while ((result == FR_OK) && (f_gets(line, sizeof(line), &source) != NULL))
+    {
+        unsigned int y, mo, d, h, mi, s, amount;
+        UINT written = 0U;
+        UINT length = (UINT)strlen(line);
+
+        if (sscanf(line, "%u-%u-%u,%u:%u:%u,%u",
+                   &y, &mo, &d, &h, &mi, &s, &amount) == 7)
+        {
+            ordinal++;
+            if (ordinal == sourceOrdinal)
+            {
+                continue;
+            }
+        }
+
+        result = f_write(&temp, line, length, &written);
+        if ((result == FR_OK) && (written != length))
+        {
+            result = FR_DISK_ERR;
+        }
+    }
+
+    if (result == FR_OK)
+    {
+        result = f_error(&source);
+    }
+    if (result == FR_OK)
+    {
+        result = f_sync(&temp);
+    }
+    (void)f_close(&source);
+    {
+        FRESULT closeResult = f_close(&temp);
+        if (result == FR_OK)
+        {
+            result = closeResult;
+        }
+    }
+
+    if (result != FR_OK)
+    {
+        (void)f_unlink(tempPath);
+        return result;
+    }
+
+    result = f_rename(appSdFilePath, backupPath);
+    if (result == FR_OK)
+    {
+        result = f_rename(tempPath, appSdFilePath);
+        if (result == FR_OK)
+        {
+            (void)f_unlink(backupPath);
+        }
+        else
+        {
+            (void)f_rename(backupPath, appSdFilePath);
+        }
+    }
+    return result;
+}
+
 
 static void APP_ProcessTouch(void)
 {
     static uint8_t previousTouching = 0U;
     static int8_t activeButtonIndex = -1;
+    static uint8_t historyTouchActive = 0U;
+    static uint16_t historyTouchStartY = 0U;
+    static uint16_t historyTouchLastY = 0U;
 
     uint8_t touching;
     uint8_t i;
@@ -1452,11 +1608,34 @@ static void APP_ProcessTouch(void)
         touchX = appTouchState.touchX[0];
         touchY = appTouchState.touchY[0];
 
+        if (touchX < APP_SEPARATOR_X)
+        {
+            historyTouchActive = 1U;
+            historyTouchStartY = touchY;
+            historyTouchLastY = touchY;
+        }
+
         currentTick = HAL_GetTick();
 
         if ((currentTick - appLastPressTick) >=
             APP_TOUCH_DEBOUNCE_MS)
         {
+            if ((appSelectedRecordIndex >= 0) &&
+                (APP_PointInRect(touchX, touchY, APP_DELETE_X,
+                                 APP_DELETE_Y, APP_DELETE_WIDTH,
+                                 APP_DELETE_HEIGHT) != 0U))
+            {
+                appLastPressTick = currentTick;
+                if (APP_DeleteRecord(
+                        appMilkRecords[appSelectedRecordIndex].sourceOrdinal)
+                    == FR_OK)
+                {
+                    APP_InitTodayState();
+                    (void)APP_LoadTodayRecords();
+                    APP_DrawInterface();
+                }
+            }
+
             for (i = 0U;
                  i < APP_MILK_BUTTON_COUNT;
                  i++)
@@ -1484,12 +1663,65 @@ static void APP_ProcessTouch(void)
         }
     }
 
+    if ((touching != 0U) && (historyTouchActive != 0U))
+    {
+        historyTouchLastY = appTouchState.touchY[0];
+    }
+
     /*
      * 手指松开。
      */
     if ((touching == 0U) &&
         (previousTouching != 0U))
     {
+        if (historyTouchActive != 0U)
+        {
+            int32_t swipe = (int32_t)historyTouchStartY -
+                            (int32_t)historyTouchLastY;
+            uint16_t totalPages = (appRecordCount == 0U) ? 1U :
+                (uint16_t)((appRecordCount + APP_RECORDS_PER_PAGE - 1U) /
+                           APP_RECORDS_PER_PAGE);
+
+            if ((swipe >= (int32_t)APP_HISTORY_SWIPE_PIXELS) &&
+                ((appHistoryPage + 1U) < totalPages))
+            {
+                appHistoryPage++;
+                appSelectedRecordIndex = -1;
+                APP_DrawLeftPanel();
+                APP_DrawDeleteButton();
+            }
+            else if ((swipe <= -(int32_t)APP_HISTORY_SWIPE_PIXELS) &&
+                     (appHistoryPage > 0U))
+            {
+                appHistoryPage--;
+                appSelectedRecordIndex = -1;
+                APP_DrawLeftPanel();
+                APP_DrawDeleteButton();
+            }
+            else if ((swipe < (int32_t)APP_HISTORY_SWIPE_PIXELS) &&
+                     (swipe > -(int32_t)APP_HISTORY_SWIPE_PIXELS) &&
+                     (historyTouchLastY >= APP_RECORD_Y))
+            {
+                uint16_t row = (uint16_t)
+                    ((historyTouchLastY - APP_RECORD_Y) /
+                     APP_RECORD_LINE_HEIGHT);
+                uint16_t endIndex = appRecordCount -
+                    (uint16_t)(appHistoryPage * APP_RECORDS_PER_PAGE);
+                uint16_t pageCount = (endIndex > APP_RECORDS_PER_PAGE) ?
+                    APP_RECORDS_PER_PAGE : endIndex;
+
+                if (row < pageCount)
+                {
+                    appSelectedRecordIndex =
+                        (int16_t)(endIndex - 1U - row);
+                    APP_DrawLeftPanel();
+                    APP_DrawDeleteButton();
+                }
+            }
+
+            historyTouchActive = 0U;
+        }
+
         if (activeButtonIndex >= 0)
         {
             APP_DrawMilkButton(
