@@ -72,6 +72,24 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/Components/ft5336
     BSP/Components/rk043fn48h
     BSP/Fonts
+    Middlewares/Third_Party/LwIP/src/include
+    Middlewares/Third_Party/LwIP/system
+    Drivers/BSP/Components/lan8742
+)
+
+file(GLOB LWIP_CORE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/LwIP/src/core/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/LwIP/src/core/ipv4/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/LwIP/src/api/*.c"
+)
+
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    ${LWIP_CORE_SOURCES}
+    Middlewares/Third_Party/LwIP/src/netif/ethernet.c
+    Middlewares/Third_Party/LwIP/src/apps/sntp/sntp.c
+    Middlewares/Third_Party/LwIP/system/OS/sys_arch.c
+    Drivers/BSP/Components/lan8742/lan8742.c
+    Network/Target/ethernetif.c
 )
 
 # Add project symbols (macros)

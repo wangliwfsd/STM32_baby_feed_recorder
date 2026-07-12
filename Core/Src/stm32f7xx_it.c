@@ -62,6 +62,7 @@ extern TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN EV */
 extern SD_HandleTypeDef hsd1;
+extern ETH_HandleTypeDef EthHandle;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -219,6 +220,11 @@ void DMA2D_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+void ETH_IRQHandler(void)
+{
+    HAL_ETH_IRQHandler(&EthHandle);
+}
 
 void SDMMC1_IRQHandler(void)
 {

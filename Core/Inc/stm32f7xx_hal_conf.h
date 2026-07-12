@@ -212,6 +212,12 @@
 /* Definition of the Ethernet driver buffers size and count */
 #define ETH_RX_BUF_SIZE                1524 /* buffer size for receive               */
 #define ETH_TX_BUF_SIZE                ETH_MAX_PACKET_SIZE /* buffer size for transmit              */
+#define ETH_MAC_ADDR0                 ((uint8_t)0x02)
+#define ETH_MAC_ADDR1                 ((uint8_t)0x00)
+#define ETH_MAC_ADDR2                 ((uint8_t)0x00)
+#define ETH_MAC_ADDR3                 ((uint8_t)0x74)
+#define ETH_MAC_ADDR4                 ((uint8_t)0x6F)
+#define ETH_MAC_ADDR5                 ((uint8_t)0x01)
 #define ETH_RXBUFNB                    ((uint32_t)4U)       /* 4 Rx buffers of size ETH_RX_BUF_SIZE  */
 #define ETH_TXBUFNB                    ((uint32_t)4U)       /* 4 Tx buffers of size ETH_TX_BUF_SIZE  */
 

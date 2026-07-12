@@ -35,6 +35,11 @@
 #include "ff.h"
 #include "diskio.h"
 #include "bsp_driver_sd.h"
+#include "lwip/tcpip.h"
+#include "lwip/dhcp.h"
+#include "lwip/netifapi.h"
+#include "lwip/apps/sntp.h"
+#include "ethernetif.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -79,6 +84,10 @@
 #define APP_MENU_RIGHT_X              260U
 #define APP_MENU_TOP_Y                 75U
 #define APP_MENU_BOTTOM_Y             165U
+#define APP_SYNC_CANCEL_X             170U
+#define APP_SYNC_CANCEL_Y             185U
+#define APP_SYNC_CANCEL_WIDTH         140U
+#define APP_SYNC_CANCEL_HEIGHT         55U
 
 #define RTC_INIT_MAGIC             0x32F3U
 
@@ -99,25 +108,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-#if defined ( __ICCARM__ ) /*!< IAR Compiler */
-#pragma location=0x2004c000
-ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-#pragma location=0x2004c0a0
-ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
-
-#elif defined ( __CC_ARM )  /* MDK ARM Compiler */
-
-__attribute__((at(0x2004c000))) ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-__attribute__((at(0x2004c0a0))) ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
-
-#elif defined ( __GNUC__ ) /* GNU Compiler */
-
-ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection"))); /* Ethernet Rx DMA Descriptors */
-ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection")));   /* Ethernet Tx DMA Descriptors */
-#endif
-
-ETH_TxPacketConfig TxConfig;
-
 ADC_HandleTypeDef hadc3;
 
 CRC_HandleTypeDef hcrc;
@@ -271,6 +261,9 @@ static uint8_t appBspSdCardState = 0xFFU;
 static BYTE appSdPhysicalDrive = 0xFFU;
 static uint8_t appSdFailStage = 0U;
 static uint8_t appSdReady = 0U;
+static struct netif appNetif;
+static volatile uint8_t appTimeSynchronized = 0U;
+static uint8_t appNetworkInitialized = 0U;
 
 
 typedef enum
@@ -307,7 +300,6 @@ static void MX_ADC3_Init(void);
 static void MX_CRC_Init(void);
 static void MX_DCMI_Init(void);
 static void MX_DMA2D_Init(void);
-static void MX_ETH_Init(void);
 static void MX_FMC_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C3_Init(void);
@@ -335,9 +327,13 @@ static void APP_Run(void);
 static void APP_BootMenu(void);
 static FRESULT APP_ClearAllHistory(void);
 static uint8_t APP_ConfirmClearHistory(void);
+static void APP_NetworkInit(void);
+static uint8_t APP_SyncNetworkTime(void);
+static uint8_t APP_SyncCancelRequested(void);
 
 static void APP_DrawInterface(void);
 static void APP_DrawLeftPanel(void);
+static void APP_DrawCurrentTime(uint8_t force);
 
 static void APP_DrawMilkButton(
     uint8_t buttonIndex,
@@ -1109,10 +1105,169 @@ static uint8_t APP_ConfirmClearHistory(void)
     }
 }
 
+void APP_SNTP_SetUnixTime(unsigned long seconds)
+{
+    int64_t localSeconds = (int64_t)seconds + (8LL * 60LL * 60LL);
+    int64_t days = localSeconds / 86400LL;
+    uint32_t daySeconds = (uint32_t)(localSeconds % 86400LL);
+    int64_t z = days + 719468LL;
+    int64_t era = (z >= 0LL ? z : z - 146096LL) / 146097LL;
+    uint32_t doe = (uint32_t)(z - era * 146097LL);
+    uint32_t yoe = (doe - doe / 1460U + doe / 36524U - doe / 146096U) / 365U;
+    int32_t year = (int32_t)yoe + (int32_t)(era * 400LL);
+    uint32_t doy = doe - (365U * yoe + yoe / 4U - yoe / 100U);
+    uint32_t mp = (5U * doy + 2U) / 153U;
+    uint32_t day = doy - (153U * mp + 2U) / 5U + 1U;
+    uint32_t month = (uint32_t)((int32_t)mp + ((mp < 10U) ? 3 : -9));
+    RTC_TimeTypeDef rtcTime = {0};
+    RTC_DateTypeDef rtcDate = {0};
+
+    year += (month <= 2U) ? 1 : 0;
+    if ((year < 2000) || (year > 2099))
+    {
+        return;
+    }
+
+    rtcTime.Hours = (uint8_t)(daySeconds / 3600U);
+    rtcTime.Minutes = (uint8_t)((daySeconds % 3600U) / 60U);
+    rtcTime.Seconds = (uint8_t)(daySeconds % 60U);
+    rtcTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    rtcTime.StoreOperation = RTC_STOREOPERATION_RESET;
+    rtcDate.Year = (uint8_t)(year - 2000);
+    rtcDate.Month = (uint8_t)month;
+    rtcDate.Date = (uint8_t)day;
+    rtcDate.WeekDay = APP_CalculateWeekDay((uint16_t)year,
+                                           (uint8_t)month,
+                                           (uint8_t)day);
+
+    if ((HAL_RTC_SetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN) == HAL_OK) &&
+        (HAL_RTC_SetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN) == HAL_OK))
+    {
+        HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, RTC_INIT_MAGIC);
+        appTimeSynchronized = 1U;
+    }
+}
+
+static void APP_NetworkInit(void)
+{
+    ip_addr_t ipaddr;
+    ip_addr_t netmask;
+    ip_addr_t gateway;
+
+    if (appNetworkInitialized != 0U)
+    {
+        return;
+    }
+
+    ip_addr_set_zero_ip4(&ipaddr);
+    ip_addr_set_zero_ip4(&netmask);
+    ip_addr_set_zero_ip4(&gateway);
+    tcpip_init(NULL, NULL);
+    netif_add(&appNetif, &ipaddr, &netmask, &gateway, NULL,
+              ethernetif_init, tcpip_input);
+    netif_set_default(&appNetif);
+    netif_set_up(&appNetif);
+
+    osThreadDef(EthLink, ethernet_link_thread, osPriorityNormal, 0,
+                configMINIMAL_STACK_SIZE * 2U);
+    (void)osThreadCreate(osThread(EthLink), &appNetif);
+    (void)netifapi_dhcp_start(&appNetif);
+    appNetworkInitialized = 1U;
+}
+
+static uint8_t APP_SyncCancelRequested(void)
+{
+    TS_StateTypeDef state = {0};
+
+    if ((BSP_TS_GetState(&state) == TS_OK) &&
+        (state.touchDetected > 0U) &&
+        (APP_PointInRect(state.touchX[0], state.touchY[0],
+                         APP_SYNC_CANCEL_X, APP_SYNC_CANCEL_Y,
+                         APP_SYNC_CANCEL_WIDTH,
+                         APP_SYNC_CANCEL_HEIGHT) != 0U))
+    {
+        return 1U;
+    }
+    return 0U;
+}
+
+static uint8_t APP_SyncNetworkTime(void)
+{
+    uint32_t started;
+    TS_StateTypeDef state = {0};
+
+    APP_NetworkInit();
+
+    /* Do not treat the menu tap that opened this page as CANCEL. */
+    do
+    {
+        (void)BSP_TS_GetState(&state);
+        osDelay(20U);
+    } while (state.touchDetected > 0U);
+
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_DisplayStringAt(0U, 145U,
+        (uint8_t *)"Waiting for cable / DHCP...", CENTER_MODE);
+
+    started = HAL_GetTick();
+    while ((HAL_GetTick() - started) < 20000U)
+    {
+        if (APP_SyncCancelRequested() != 0U)
+        {
+            return 2U;
+        }
+        if (netif_is_link_up(&appNetif) &&
+            !ip4_addr_isany_val(*netif_ip4_addr(&appNetif)))
+        {
+            break;
+        }
+        osDelay(100U);
+    }
+
+    if (!netif_is_link_up(&appNetif) ||
+        ip4_addr_isany_val(*netif_ip4_addr(&appNetif)))
+    {
+        return 0U;
+    }
+
+    {
+        char ipText[40];
+        BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+        BSP_LCD_FillRect(0U, 140U, BSP_LCD_GetXSize(), 25U);
+        snprintf(ipText, sizeof(ipText), "IP %s - contacting NTP",
+                 ip4addr_ntoa(netif_ip4_addr(&appNetif)));
+        BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+        BSP_LCD_DisplayStringAt(0U, 145U,
+                                (uint8_t *)ipText, CENTER_MODE);
+    }
+
+    appTimeSynchronized = 0U;
+    sntp_stop();
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0U, "pool.ntp.org");
+    sntp_init();
+
+    started = HAL_GetTick();
+    while (((HAL_GetTick() - started) < 15000U) &&
+           (appTimeSynchronized == 0U))
+    {
+        if (APP_SyncCancelRequested() != 0U)
+        {
+            sntp_stop();
+            return 2U;
+        }
+        osDelay(100U);
+    }
+    return appTimeSynchronized;
+}
+
 static void APP_BootMenu(void)
 {
     TS_StateTypeDef state = {0};
     uint8_t previous = 0U;
+    char connectionStatus[64];
 
     for (;;)
     {
@@ -1128,17 +1283,43 @@ static void APP_BootMenu(void)
         APP_DrawSetupButton(APP_MENU_RIGHT_X, APP_MENU_TOP_Y,
             APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "SET TIME");
         APP_DrawSetupButton(APP_MENU_LEFT_X, APP_MENU_BOTTOM_Y,
-            APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "SD STATUS");
+            APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "SYNC TIME");
         APP_DrawSetupButton(APP_MENU_RIGHT_X, APP_MENU_BOTTOM_Y,
             APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "CLEAR HISTORY");
 
         BSP_LCD_SetFont(&Font16);
         BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
-        BSP_LCD_SetTextColor((appSdReady != 0U) ?
-                             LCD_COLOR_GREEN : LCD_COLOR_RED);
+        if (appNetworkInitialized == 0U)
+        {
+            snprintf(connectionStatus, sizeof(connectionStatus),
+                     "%s   NET: OFF",
+                     (appSdReady != 0U) ? "SD: OK" : "SD: ERROR");
+            BSP_LCD_SetTextColor(LCD_COLOR_DARKYELLOW);
+        }
+        else if (!netif_is_link_up(&appNetif))
+        {
+            snprintf(connectionStatus, sizeof(connectionStatus),
+                     "%s   NET: NO CABLE",
+                     (appSdReady != 0U) ? "SD: OK" : "SD: ERROR");
+            BSP_LCD_SetTextColor(LCD_COLOR_RED);
+        }
+        else if (ip4_addr_isany_val(*netif_ip4_addr(&appNetif)))
+        {
+            snprintf(connectionStatus, sizeof(connectionStatus),
+                     "%s   NET: DHCP...",
+                     (appSdReady != 0U) ? "SD: OK" : "SD: ERROR");
+            BSP_LCD_SetTextColor(LCD_COLOR_ORANGE);
+        }
+        else
+        {
+            snprintf(connectionStatus, sizeof(connectionStatus),
+                     "%s   NET: %s",
+                     (appSdReady != 0U) ? "SD: OK" : "SD: ERROR",
+                     ip4addr_ntoa(netif_ip4_addr(&appNetif)));
+            BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+        }
         BSP_LCD_DisplayStringAt(0U, 245U,
-            (uint8_t *)((appSdReady != 0U) ? "SD READY" : "SD ERROR"),
-            CENTER_MODE);
+            (uint8_t *)connectionStatus, CENTER_MODE);
 
         do
         {
@@ -1172,8 +1353,31 @@ static void APP_BootMenu(void)
                             APP_MENU_BOTTOM_Y, APP_MENU_BUTTON_WIDTH,
                             APP_MENU_BUTTON_HEIGHT) != 0U)
                     {
-                        APP_ShowSdTestResult((appSdReady != 0U) ?
-                                             FR_OK : FR_DISK_ERR);
+                        uint8_t synced;
+                        BSP_LCD_Clear(LCD_COLOR_WHITE);
+                        BSP_LCD_SetFont(&Font20);
+                        BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+                        BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
+                        BSP_LCD_DisplayStringAt(0U, 110U,
+                            (uint8_t *)"CONNECTING / SYNCING...",
+                            CENTER_MODE);
+                        APP_DrawSetupButton(APP_SYNC_CANCEL_X,
+                            APP_SYNC_CANCEL_Y, APP_SYNC_CANCEL_WIDTH,
+                            APP_SYNC_CANCEL_HEIGHT, "CANCEL");
+                        synced = APP_SyncNetworkTime();
+                        BSP_LCD_Clear(LCD_COLOR_WHITE);
+                        BSP_LCD_SetTextColor((synced == 1U) ?
+                                             LCD_COLOR_GREEN :
+                                             ((synced == 2U) ?
+                                              LCD_COLOR_ORANGE :
+                                              LCD_COLOR_RED));
+                        BSP_LCD_DisplayStringAt(0U, 110U,
+                            (uint8_t *)((synced == 1U) ?
+                                "TIME SYNCED" :
+                                ((synced == 2U) ?
+                                 "SYNC CANCELLED" : "SYNC FAILED")),
+                            CENTER_MODE);
+                        osDelay(1200U);
                         break;
                     }
                     if (APP_PointInRect(x, y, APP_MENU_RIGHT_X,
@@ -1285,6 +1489,7 @@ static void APP_Run(void)
     while (1)
     {
         APP_ProcessTouch();
+        APP_DrawCurrentTime(0U);
         osDelay(10U);
     }
 }
@@ -1307,6 +1512,8 @@ static void APP_DrawInterface(void)
     APP_DrawLeftPanel();
     APP_DrawAllMilkButtons();
     APP_DrawDeleteButton();
+
+    APP_DrawCurrentTime(1U);
 
     BSP_LCD_SetFont(&Font16);
     BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
@@ -1358,6 +1565,38 @@ static void APP_GetHistoryPageRange(uint16_t *firstIndex,
         *firstIndex = (*endIndex > APP_RECORDS_PER_PAGE) ?
             (uint16_t)(*endIndex - APP_RECORDS_PER_PAGE) : 0U;
     }
+}
+
+static void APP_DrawCurrentTime(uint8_t force)
+{
+    static uint8_t lastSecond = 0xFFU;
+    RTC_TimeTypeDef rtcTime = {0};
+    RTC_DateTypeDef rtcDate = {0};
+    char text[12];
+
+    if (HAL_RTC_GetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return;
+    }
+    /* Reading the date unlocks the RTC shadow registers for the next read. */
+    if (HAL_RTC_GetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return;
+    }
+    if ((force == 0U) && (rtcTime.Seconds == lastSecond))
+    {
+        return;
+    }
+    lastSecond = rtcTime.Seconds;
+
+    snprintf(text, sizeof(text), "%02u:%02u:%02u",
+             rtcTime.Hours, rtcTime.Minutes, rtcTime.Seconds);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_FillRect(292U, 2U, 105U, 22U);
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_DisplayStringAt(300U, 5U, (uint8_t *)text, LEFT_MODE);
 }
 
 static void APP_DrawLeftPanel(void)
@@ -2400,7 +2639,6 @@ int main(void)
   MX_CRC_Init();
   MX_DCMI_Init();
   MX_DMA2D_Init();
-  MX_ETH_Init();
   MX_FMC_Init();
   MX_I2C1_Init();
   MX_I2C3_Init();
@@ -2705,55 +2943,6 @@ static void MX_DMA2D_Init(void)
   /* USER CODE BEGIN DMA2D_Init 2 */
 
   /* USER CODE END DMA2D_Init 2 */
-
-}
-
-/**
-  * @brief ETH Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ETH_Init(void)
-{
-
-  /* USER CODE BEGIN ETH_Init 0 */
-
-  /* USER CODE END ETH_Init 0 */
-
-   static uint8_t MACAddr[6];
-
-  /* USER CODE BEGIN ETH_Init 1 */
-
-  /* USER CODE END ETH_Init 1 */
-  heth.Instance = ETH;
-  MACAddr[0] = 0x00;
-  MACAddr[1] = 0x80;
-  MACAddr[2] = 0xE1;
-  MACAddr[3] = 0x00;
-  MACAddr[4] = 0x00;
-  MACAddr[5] = 0x00;
-  heth.Init.MACAddr = &MACAddr[0];
-  heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
-  heth.Init.TxDesc = DMATxDscrTab;
-  heth.Init.RxDesc = DMARxDscrTab;
-  heth.Init.RxBuffLen = 1524;
-
-  /* USER CODE BEGIN MACADDRESS */
-
-  /* USER CODE END MACADDRESS */
-
-  if (HAL_ETH_Init(&heth) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
-  TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
-  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
-  TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
-  /* USER CODE BEGIN ETH_Init 2 */
-
-  /* USER CODE END ETH_Init 2 */
 
 }
 
