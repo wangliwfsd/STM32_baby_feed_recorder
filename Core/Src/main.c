@@ -59,7 +59,7 @@
 #define APP_MILK_BUTTON_Y3           180U
 
 #define APP_RECORD_X                  10U
-#define APP_RECORD_Y                  76U
+#define APP_RECORD_Y                  88U
 #define APP_RECORD_WIDTH             260U
 #define APP_RECORD_HEIGHT            185U
 #define APP_RECORD_LINE_HEIGHT        22U
@@ -73,6 +73,12 @@
 #define APP_DELETE_Y                  240U
 #define APP_DELETE_WIDTH              180U
 #define APP_DELETE_HEIGHT              28U
+#define APP_MENU_BUTTON_WIDTH         190U
+#define APP_MENU_BUTTON_HEIGHT         65U
+#define APP_MENU_LEFT_X                30U
+#define APP_MENU_RIGHT_X              260U
+#define APP_MENU_TOP_Y                 75U
+#define APP_MENU_BOTTOM_Y             165U
 
 #define RTC_INIT_MAGIC             0x32F3U
 
@@ -264,6 +270,7 @@ static uint8_t appBspSdInitResult = 0xFFU;
 static uint8_t appBspSdCardState = 0xFFU;
 static BYTE appSdPhysicalDrive = 0xFFU;
 static uint8_t appSdFailStage = 0U;
+static uint8_t appSdReady = 0U;
 
 
 typedef enum
@@ -325,6 +332,9 @@ void StartDefaultTask(void const * argument);
 
 static void APP_Init(void);
 static void APP_Run(void);
+static void APP_BootMenu(void);
+static FRESULT APP_ClearAllHistory(void);
+static uint8_t APP_ConfirmClearHistory(void);
 
 static void APP_DrawInterface(void);
 static void APP_DrawLeftPanel(void);
@@ -342,6 +352,9 @@ static FRESULT APP_LoadTodayRecords(void);
 static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record);
 static FRESULT APP_DeleteRecord(uint32_t sourceOrdinal);
 static void APP_DrawDeleteButton(void);
+static void APP_GetHistoryPageRange(uint16_t *firstIndex,
+                                    uint16_t *endIndex,
+                                    uint16_t *totalPages);
 static void APP_ProcessTouch(void);
 
 static uint8_t APP_PointInRect(
@@ -360,6 +373,8 @@ static uint8_t APP_CalculateWeekDay(
     uint16_t year,
     uint8_t month,
     uint8_t day);
+
+static uint8_t APP_RtcIsValid(void);
 
 static FRESULT APP_SD_Test(void);
 static void APP_ShowSdTestResult(FRESULT result);
@@ -460,6 +475,30 @@ static uint8_t APP_CalculateWeekDay(
     return (uint8_t)weekDay;
 }
 
+
+static uint8_t APP_RtcIsValid(void)
+{
+    RTC_TimeTypeDef rtcTime = {0};
+    RTC_DateTypeDef rtcDate = {0};
+
+    if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) != RTC_INIT_MAGIC)
+    {
+        return 0U;
+    }
+    if (HAL_RTC_GetTime(&hrtc, &rtcTime, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return 0U;
+    }
+    if (HAL_RTC_GetDate(&hrtc, &rtcDate, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        return 0U;
+    }
+
+    return ((rtcDate.Month >= 1U) && (rtcDate.Month <= 12U) &&
+            (rtcDate.Date >= 1U) && (rtcDate.Date <= 31U) &&
+            (rtcTime.Hours <= 23U) && (rtcTime.Minutes <= 59U) &&
+            (rtcTime.Seconds <= 59U)) ? 1U : 0U;
+}
 
 static void APP_LoadRtcTime(void)
 {
@@ -977,6 +1016,191 @@ static void APP_TimeSetupScreen(void)
     }
 }
 
+static FRESULT APP_ClearAllHistory(void)
+{
+    FIL file;
+    FRESULT result;
+    UINT written = 0U;
+    static const char header[] = "date,time,amount_ml\r\n";
+
+    if (appSdReady == 0U)
+    {
+        return FR_NOT_READY;
+    }
+
+    result = f_open(&file, appSdFilePath, FA_CREATE_ALWAYS | FA_WRITE);
+    if (result != FR_OK)
+    {
+        return result;
+    }
+    if (result == FR_OK)
+    {
+        result = f_write(&file, header, sizeof(header) - 1U, &written);
+        if ((result == FR_OK) && (written != (sizeof(header) - 1U)))
+        {
+            result = FR_DISK_ERR;
+        }
+    }
+    if (result == FR_OK)
+    {
+        result = f_sync(&file);
+    }
+    if (result == FR_OK)
+    {
+        result = f_close(&file);
+    }
+    else
+    {
+        (void)f_close(&file);
+    }
+
+    if (result == FR_OK)
+    {
+        APP_InitTodayState();
+    }
+    return result;
+}
+
+static uint8_t APP_ConfirmClearHistory(void)
+{
+    TS_StateTypeDef state = {0};
+    uint8_t previous = 0U;
+
+    BSP_LCD_Clear(LCD_COLOR_WHITE);
+    BSP_LCD_SetFont(&Font20);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetTextColor(LCD_COLOR_RED);
+    BSP_LCD_DisplayStringAt(0U, 55U,
+        (uint8_t *)"DELETE ALL HISTORY?", CENTER_MODE);
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_DisplayStringAt(0U, 105U,
+        (uint8_t *)"This cannot be undone", CENTER_MODE);
+    APP_DrawSetupButton(80U, 175U, 130U, 60U, "CANCEL");
+    APP_DrawSetupButton(270U, 175U, 130U, 60U, "DELETE");
+
+    do
+    {
+        (void)BSP_TS_GetState(&state);
+        osDelay(20U);
+    } while (state.touchDetected > 0U);
+
+    for (;;)
+    {
+        if (BSP_TS_GetState(&state) == TS_OK)
+        {
+            uint8_t touching = (state.touchDetected > 0U) ? 1U : 0U;
+            if ((touching != 0U) && (previous == 0U))
+            {
+                uint16_t x = state.touchX[0];
+                uint16_t y = state.touchY[0];
+                if (APP_PointInRect(x, y, 80U, 175U, 130U, 60U) != 0U)
+                {
+                    return 0U;
+                }
+                if (APP_PointInRect(x, y, 270U, 175U, 130U, 60U) != 0U)
+                {
+                    return 1U;
+                }
+            }
+            previous = touching;
+        }
+        osDelay(20U);
+    }
+}
+
+static void APP_BootMenu(void)
+{
+    TS_StateTypeDef state = {0};
+    uint8_t previous = 0U;
+
+    for (;;)
+    {
+        BSP_LCD_Clear(LCD_COLOR_WHITE);
+        BSP_LCD_SetFont(&Font24);
+        BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+        BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+        BSP_LCD_DisplayStringAt(0U, 20U,
+            (uint8_t *)"MILK LOG", CENTER_MODE);
+
+        APP_DrawSetupButton(APP_MENU_LEFT_X, APP_MENU_TOP_Y,
+            APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "START");
+        APP_DrawSetupButton(APP_MENU_RIGHT_X, APP_MENU_TOP_Y,
+            APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "SET TIME");
+        APP_DrawSetupButton(APP_MENU_LEFT_X, APP_MENU_BOTTOM_Y,
+            APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "SD STATUS");
+        APP_DrawSetupButton(APP_MENU_RIGHT_X, APP_MENU_BOTTOM_Y,
+            APP_MENU_BUTTON_WIDTH, APP_MENU_BUTTON_HEIGHT, "CLEAR HISTORY");
+
+        BSP_LCD_SetFont(&Font16);
+        BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+        BSP_LCD_SetTextColor((appSdReady != 0U) ?
+                             LCD_COLOR_GREEN : LCD_COLOR_RED);
+        BSP_LCD_DisplayStringAt(0U, 245U,
+            (uint8_t *)((appSdReady != 0U) ? "SD READY" : "SD ERROR"),
+            CENTER_MODE);
+
+        do
+        {
+            (void)BSP_TS_GetState(&state);
+            osDelay(20U);
+        } while (state.touchDetected > 0U);
+        previous = 0U;
+        for (;;)
+        {
+            if (BSP_TS_GetState(&state) == TS_OK)
+            {
+                uint8_t touching = (state.touchDetected > 0U) ? 1U : 0U;
+                if ((touching != 0U) && (previous == 0U))
+                {
+                    uint16_t x = state.touchX[0];
+                    uint16_t y = state.touchY[0];
+                    if (APP_PointInRect(x, y, APP_MENU_LEFT_X,
+                            APP_MENU_TOP_Y, APP_MENU_BUTTON_WIDTH,
+                            APP_MENU_BUTTON_HEIGHT) != 0U)
+                    {
+                        return;
+                    }
+                    if (APP_PointInRect(x, y, APP_MENU_RIGHT_X,
+                            APP_MENU_TOP_Y, APP_MENU_BUTTON_WIDTH,
+                            APP_MENU_BUTTON_HEIGHT) != 0U)
+                    {
+                        APP_TimeSetupScreen();
+                        break;
+                    }
+                    if (APP_PointInRect(x, y, APP_MENU_LEFT_X,
+                            APP_MENU_BOTTOM_Y, APP_MENU_BUTTON_WIDTH,
+                            APP_MENU_BUTTON_HEIGHT) != 0U)
+                    {
+                        APP_ShowSdTestResult((appSdReady != 0U) ?
+                                             FR_OK : FR_DISK_ERR);
+                        break;
+                    }
+                    if (APP_PointInRect(x, y, APP_MENU_RIGHT_X,
+                            APP_MENU_BOTTOM_Y, APP_MENU_BUTTON_WIDTH,
+                            APP_MENU_BUTTON_HEIGHT) != 0U)
+                    {
+                        if ((APP_ConfirmClearHistory() != 0U) &&
+                            (APP_ClearAllHistory() == FR_OK))
+                        {
+                            BSP_LCD_Clear(LCD_COLOR_WHITE);
+                            BSP_LCD_SetFont(&Font20);
+                            BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+                            BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+                            BSP_LCD_DisplayStringAt(0U, 110U,
+                                (uint8_t *)"HISTORY CLEARED", CENTER_MODE);
+                            osDelay(800U);
+                        }
+                        break;
+                    }
+                }
+                previous = touching;
+            }
+            osDelay(20U);
+        }
+    }
+}
+
 static void APP_Init(void)
 {
     FRESULT sdResult;
@@ -1023,34 +1247,26 @@ static void APP_Init(void)
         Error_Handler();
     }
 
-APP_TimeSetupScreen();
-
-/*
- * 先显示状态，避免看起来像停在 RTC SAVED。
- */
-BSP_LCD_Clear(LCD_COLOR_WHITE);
-BSP_LCD_SetFont(&Font20);
-BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
-BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
-
-BSP_LCD_DisplayStringAt(
-    0U,
-    110U,
-    (uint8_t *)"TESTING SD CARD...",
-    CENTER_MODE
-);
-
-osDelay(100U);
+if (APP_RtcIsValid() == 0U)
+{
+    APP_TimeSetupScreen();
+}
 
 /*
  * 初始化、挂载并创建 CSV 文件。
  */
 sdResult = APP_SD_Test();
+appSdReady = (sdResult == FR_OK) ? 1U : 0U;
 
 /*
  * 显示测试结果。
  */
-APP_ShowSdTestResult(sdResult);
+if (sdResult != FR_OK)
+{
+    APP_ShowSdTestResult(sdResult);
+}
+
+APP_BootMenu();
 
 /*
  * SD 测试完成后，进入六个奶量按钮界面。
@@ -1091,6 +1307,57 @@ static void APP_DrawInterface(void)
     APP_DrawLeftPanel();
     APP_DrawAllMilkButtons();
     APP_DrawDeleteButton();
+
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetTextColor((appSdReady != 0U) ?
+                         LCD_COLOR_GREEN : LCD_COLOR_RED);
+    BSP_LCD_DisplayStringAt(442U, 5U,
+                            (uint8_t *)"SD", LEFT_MODE);
+}
+
+static void APP_GetHistoryPageRange(uint16_t *firstIndex,
+                                    uint16_t *endIndex,
+                                    uint16_t *totalPages)
+{
+    uint16_t todayCount = 0U;
+    uint16_t todayShown;
+    uint16_t historyCount;
+
+    while (todayCount < appRecordCount)
+    {
+        const APP_MilkRecordTypeDef *record =
+            &appMilkRecords[appRecordCount - 1U - todayCount];
+        if ((record->year != appTodayYear) ||
+            (record->month != appTodayMonth) ||
+            (record->day != appTodayDay))
+        {
+            break;
+        }
+        todayCount++;
+    }
+
+    todayShown = (todayCount > APP_RECORDS_PER_PAGE) ?
+        APP_RECORDS_PER_PAGE : todayCount;
+    historyCount = appRecordCount - todayShown;
+    *totalPages = (uint16_t)(1U +
+        ((historyCount + APP_RECORDS_PER_PAGE - 1U) /
+         APP_RECORDS_PER_PAGE));
+
+    if (appHistoryPage == 0U)
+    {
+        *endIndex = appRecordCount;
+        *firstIndex = appRecordCount - todayShown;
+    }
+    else
+    {
+        uint16_t offset = (uint16_t)
+            ((appHistoryPage - 1U) * APP_RECORDS_PER_PAGE);
+        *endIndex = (historyCount > offset) ?
+            (uint16_t)(historyCount - offset) : 0U;
+        *firstIndex = (*endIndex > APP_RECORDS_PER_PAGE) ?
+            (uint16_t)(*endIndex - APP_RECORDS_PER_PAGE) : 0U;
+    }
 }
 
 static void APP_DrawLeftPanel(void)
@@ -1100,6 +1367,42 @@ static void APP_DrawLeftPanel(void)
     uint16_t firstIndex;
     uint16_t endIndex;
     uint16_t totalPages;
+    uint16_t displayYear = appTodayYear;
+    uint8_t displayMonth = appTodayMonth;
+    uint8_t displayDay = appTodayDay;
+    uint32_t displayTotal = 0U;
+    uint16_t displayFeeds = 0U;
+    const APP_MilkRecordTypeDef *displayLast = NULL;
+
+    APP_GetHistoryPageRange(&firstIndex, &endIndex, &totalPages);
+    if (appHistoryPage >= totalPages)
+    {
+        appHistoryPage = totalPages - 1U;
+        APP_GetHistoryPageRange(&firstIndex, &endIndex, &totalPages);
+    }
+
+    if ((appHistoryPage > 0U) && (endIndex > firstIndex))
+    {
+        const APP_MilkRecordTypeDef *latest = &appMilkRecords[endIndex - 1U];
+        displayYear = latest->year;
+        displayMonth = latest->month;
+        displayDay = latest->day;
+    }
+
+    {
+        uint16_t j;
+        for (j = 0U; j < appRecordCount; j++)
+        {
+            if ((appMilkRecords[j].year == displayYear) &&
+                (appMilkRecords[j].month == displayMonth) &&
+                (appMilkRecords[j].day == displayDay))
+            {
+                displayTotal += appMilkRecords[j].amountMl;
+                displayFeeds++;
+                displayLast = &appMilkRecords[j];
+            }
+        }
+    }
 
     /*
      * 清除整个左侧区域。
@@ -1121,9 +1424,9 @@ static void APP_DrawLeftPanel(void)
         text,
         sizeof(text),
         "Date: %04u-%02u-%02u",
-        appTodayYear,
-        appTodayMonth,
-        appTodayDay
+        displayYear,
+        displayMonth,
+        displayDay
     );
 
     BSP_LCD_DisplayStringAt(
@@ -1136,34 +1439,42 @@ static void APP_DrawLeftPanel(void)
     snprintf(
         text,
         sizeof(text),
-        "Total: %lu ml",
-        (unsigned long)appTodayTotalMl
+        "Total:%lu ml  Feeds:%u",
+        (unsigned long)displayTotal,
+        (unsigned int)displayFeeds
     );
 
     BSP_LCD_DisplayStringAt(
         APP_RECORD_X,
-        32U,
+        29U,
         (uint8_t *)text,
         LEFT_MODE
     );
 
-    totalPages = (appRecordCount == 0U) ? 1U :
-        (uint16_t)((appRecordCount + APP_RECORDS_PER_PAGE - 1U) /
-                   APP_RECORDS_PER_PAGE);
-    if (appHistoryPage >= totalPages)
+    if (displayLast != NULL)
     {
-        appHistoryPage = totalPages - 1U;
+        snprintf(text, sizeof(text), "Last: %02u:%02u  %u ml",
+                 displayLast->hour, displayLast->minute,
+                 displayLast->amountMl);
     }
+    else
+    {
+        snprintf(text, sizeof(text), "Last: --:--  -- ml");
+    }
+    BSP_LCD_DisplayStringAt(APP_RECORD_X, 50U,
+                            (uint8_t *)text, LEFT_MODE);
 
-    snprintf(text, sizeof(text), "History  Page %u/%u",
-             (unsigned int)(appHistoryPage + 1U),
-             (unsigned int)totalPages);
-    BSP_LCD_DisplayStringAt(APP_RECORD_X, 55U, (uint8_t *)text, LEFT_MODE);
-
-    endIndex = appRecordCount -
-        (uint16_t)(appHistoryPage * APP_RECORDS_PER_PAGE);
-    firstIndex = (endIndex > APP_RECORDS_PER_PAGE) ?
-        (uint16_t)(endIndex - APP_RECORDS_PER_PAGE) : 0U;
+    if (appHistoryPage == 0U)
+    {
+        snprintf(text, sizeof(text), "TODAY RECORDS");
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "HISTORY  Page %u/%u",
+                 (unsigned int)appHistoryPage,
+                 (unsigned int)(totalPages - 1U));
+    }
+    BSP_LCD_DisplayStringAt(APP_RECORD_X, 69U, (uint8_t *)text, LEFT_MODE);
 
     for (i = 0U; i < (endIndex - firstIndex); i++)
     {
@@ -1678,9 +1989,11 @@ static void APP_ProcessTouch(void)
         {
             int32_t swipe = (int32_t)historyTouchStartY -
                             (int32_t)historyTouchLastY;
-            uint16_t totalPages = (appRecordCount == 0U) ? 1U :
-                (uint16_t)((appRecordCount + APP_RECORDS_PER_PAGE - 1U) /
-                           APP_RECORDS_PER_PAGE);
+            uint16_t firstIndex;
+            uint16_t endIndex;
+            uint16_t totalPages;
+
+            APP_GetHistoryPageRange(&firstIndex, &endIndex, &totalPages);
 
             if ((swipe >= (int32_t)APP_HISTORY_SWIPE_PIXELS) &&
                 ((appHistoryPage + 1U) < totalPages))
@@ -1705,10 +2018,13 @@ static void APP_ProcessTouch(void)
                 uint16_t row = (uint16_t)
                     ((historyTouchLastY - APP_RECORD_Y) /
                      APP_RECORD_LINE_HEIGHT);
-                uint16_t endIndex = appRecordCount -
-                    (uint16_t)(appHistoryPage * APP_RECORDS_PER_PAGE);
-                uint16_t pageCount = (endIndex > APP_RECORDS_PER_PAGE) ?
-                    APP_RECORDS_PER_PAGE : endIndex;
+                uint16_t firstIndex;
+                uint16_t endIndex;
+                uint16_t totalPages;
+                uint16_t pageCount;
+
+                APP_GetHistoryPageRange(&firstIndex, &endIndex, &totalPages);
+                pageCount = endIndex - firstIndex;
 
                 if (row < pageCount)
                 {
