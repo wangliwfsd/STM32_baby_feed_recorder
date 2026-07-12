@@ -327,6 +327,9 @@ static void APP_DrawAllMilkButtons(void);
 
 static void APP_InitTodayState(void);
 static void APP_AddMilkRecord(uint16_t amountMl);
+static FRESULT APP_AppendMilkRecord(const APP_MilkRecordTypeDef *record);
+static FRESULT APP_LoadTodayRecords(void);
+static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record);
 static void APP_ProcessTouch(void);
 
 static uint8_t APP_PointInRect(
@@ -1038,6 +1041,7 @@ APP_ShowSdTestResult(sdResult);
  * SD 测试完成后，进入六个奶量按钮界面。
  */
 APP_InitTodayState();
+(void)APP_LoadTodayRecords();
 APP_DrawInterface();
 
 appLastPressTick =
@@ -1241,7 +1245,7 @@ static void APP_AddMilkRecord(uint16_t amountMl)
     RTC_DateTypeDef rtcDate = {0};
 
     uint16_t currentYear;
-    uint8_t recordIndex;
+    APP_MilkRecordTypeDef record;
 
     if (HAL_RTC_GetTime(
             &hrtc,
@@ -1276,50 +1280,144 @@ static void APP_AddMilkRecord(uint16_t amountMl)
         appRecordCount = 0U;
     }
 
-    appTodayTotalMl += amountMl;
+    record.year = currentYear;
+    record.month = rtcDate.Month;
+    record.day = rtcDate.Date;
+    record.hour = rtcTime.Hours;
+    record.minute = rtcTime.Minutes;
+    record.second = rtcTime.Seconds;
+    record.amountMl = amountMl;
+
+    /* Only show a record after it is safely synchronized to the SD card. */
+    if (APP_AppendMilkRecord(&record) != FR_OK)
+    {
+        return;
+    }
+
+    APP_InsertTodayRecord(&record);
+
+    APP_DrawLeftPanel();
+}
+
+static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record)
+{
+    uint8_t recordIndex;
+
+    appTodayTotalMl += record->amountMl;
 
     if (appRecordCount < APP_MAX_RECORDS)
     {
-        recordIndex = appRecordCount;
-        appRecordCount++;
+        recordIndex = appRecordCount++;
     }
     else
     {
-        /*
-         * 左侧只保留最近 8 条。
-         */
-        memmove(
-            &appMilkRecords[0],
-            &appMilkRecords[1],
-            sizeof(appMilkRecords[0]) *
-                (APP_MAX_RECORDS - 1U)
-        );
-
+        memmove(&appMilkRecords[0], &appMilkRecords[1],
+                sizeof(appMilkRecords[0]) * (APP_MAX_RECORDS - 1U));
         recordIndex = APP_MAX_RECORDS - 1U;
     }
 
-    appMilkRecords[recordIndex].year =
-        currentYear;
+    appMilkRecords[recordIndex] = *record;
+}
 
-    appMilkRecords[recordIndex].month =
-        rtcDate.Month;
+static FRESULT APP_AppendMilkRecord(const APP_MilkRecordTypeDef *record)
+{
+    FIL file;
+    FRESULT result;
+    UINT bytesWritten = 0U;
+    char line[48];
+    int length;
+    uint8_t fileOpen = 0U;
 
-    appMilkRecords[recordIndex].day =
-        rtcDate.Date;
+    length = snprintf(line, sizeof(line),
+                      "%04u-%02u-%02u,%02u:%02u:%02u,%u\r\n",
+                      record->year, record->month, record->day,
+                      record->hour, record->minute, record->second,
+                      record->amountMl);
+    if ((length <= 0) || ((size_t)length >= sizeof(line)))
+    {
+        return FR_INVALID_PARAMETER;
+    }
 
-    appMilkRecords[recordIndex].hour =
-        rtcTime.Hours;
+    result = f_open(&file, appSdFilePath, FA_OPEN_ALWAYS | FA_WRITE);
+    if (result == FR_OK)
+    {
+        fileOpen = 1U;
+        result = f_lseek(&file, f_size(&file));
+    }
+    if (result == FR_OK)
+    {
+        result = f_write(&file, line, (UINT)length, &bytesWritten);
+        if ((result == FR_OK) && (bytesWritten != (UINT)length))
+        {
+            result = FR_DISK_ERR;
+        }
+    }
+    if (result == FR_OK)
+    {
+        result = f_sync(&file);
+    }
 
-    appMilkRecords[recordIndex].minute =
-        rtcTime.Minutes;
+    if (fileOpen != 0U)
+    {
+        FRESULT closeResult = f_close(&file);
+        if (result == FR_OK)
+        {
+            result = closeResult;
+        }
+    }
+    return result;
+}
 
-    appMilkRecords[recordIndex].second =
-        rtcTime.Seconds;
+static FRESULT APP_LoadTodayRecords(void)
+{
+    FIL file;
+    FRESULT result;
+    char line[64];
 
-    appMilkRecords[recordIndex].amountMl =
-        amountMl;
+    result = f_open(&file, appSdFilePath, FA_READ);
+    if (result != FR_OK)
+    {
+        return result;
+    }
 
-    APP_DrawLeftPanel();
+    while (f_gets(line, sizeof(line), &file) != NULL)
+    {
+        APP_MilkRecordTypeDef record;
+        unsigned int year, month, day, hour, minute, second, amount;
+
+        if (sscanf(line, "%u-%u-%u,%u:%u:%u,%u",
+                   &year, &month, &day, &hour, &minute, &second,
+                   &amount) != 7)
+        {
+            continue;
+        }
+
+        if ((year != appTodayYear) || (month != appTodayMonth) ||
+            (day != appTodayDay) || (hour > 23U) || (minute > 59U) ||
+            (second > 59U) || (amount > 65535U))
+        {
+            continue;
+        }
+
+        record.year = (uint16_t)year;
+        record.month = (uint8_t)month;
+        record.day = (uint8_t)day;
+        record.hour = (uint8_t)hour;
+        record.minute = (uint8_t)minute;
+        record.second = (uint8_t)second;
+        record.amountMl = (uint16_t)amount;
+        APP_InsertTodayRecord(&record);
+    }
+
+    result = f_error(&file);
+    {
+        FRESULT closeResult = f_close(&file);
+        if (result == FR_OK)
+        {
+            result = closeResult;
+        }
+    }
+    return result;
 }
 
 
@@ -1548,12 +1646,6 @@ static FRESULT APP_SD_Test(void)
         result = closeResult;
     }
 
-    (void)f_mount(
-        NULL,
-        (TCHAR const *)SDPath,
-        1U
-    );
-
     APP_SD_CaptureHalState();
     if (result == FR_OK)
     {
@@ -1716,7 +1808,8 @@ static void APP_ShowSdTestResult(FRESULT result)
         CENTER_MODE
     );
 
-    HAL_Delay(10000U);
+    /* Success only needs a brief confirmation; keep errors visible for debug. */
+    osDelay((result == FR_OK) ? 1500U : 10000U);
 }
 /* USER CODE END 0 */
 
