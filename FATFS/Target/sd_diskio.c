@@ -84,7 +84,7 @@ See BSP_SD_ErrorCallback() and BSP_SD_AbortCallback() below
 * transfer data
 */
 /* USER CODE BEGIN enableScratchBuffer */
-/* #define ENABLE_SCRATCH_BUFFER */
+/* Polling transfers below accept the FatFs working buffers directly. */
 /* USER CODE END enableScratchBuffer */
 
 /* Private variables ---------------------------------------------------------*/
@@ -249,18 +249,21 @@ DSTATUS SD_status(BYTE lun)
 
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
-  uint8_t ret;
-  DRESULT res = RES_ERROR;
-  uint32_t timer;
-#if (osCMSIS < 0x20000U)
-  osEvent event;
-#else
-  uint16_t event;
-  osStatus_t status;
-#endif
-#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
-  uint32_t alignedAddr;
-#endif
+  /*
+   * This application only performs small, infrequent CSV transfers.  Use the
+   * blocking HAL path here: it does not depend on the SDMMC interrupt and the
+   * RTOS completion queue, and is consequently much more robust during mount
+   * and metadata updates.
+   */
+  if (BSP_SD_ReadBlocks((uint32_t *)buff, (uint32_t)sector, count,
+                        SD_TIMEOUT) != MSD_OK)
+  {
+    return RES_ERROR;
+  }
+
+  return (SD_CheckStatusWithTimeout(SD_TIMEOUT) == 0) ? RES_OK : RES_ERROR;
+
+#if 0 /* DMA/RTOS implementation retained for future high-throughput use. */
   /*
   * ensure the SDCard is ready for a new operation
   */
@@ -393,6 +396,7 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
     }
 #endif
   return res;
+#endif
 }
 
 /* USER CODE BEGIN beforeWriteSection */
@@ -410,19 +414,16 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 
 DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
-  DRESULT res = RES_ERROR;
-  uint32_t timer;
+  /* See SD_read(): blocking transfers avoid a lost DMA completion message. */
+  if (BSP_SD_WriteBlocks((uint32_t *)buff, (uint32_t)sector, count,
+                         SD_TIMEOUT) != MSD_OK)
+  {
+    return RES_ERROR;
+  }
 
-#if (osCMSIS < 0x20000U)
-  osEvent event;
-#else
-  uint16_t event;
-  osStatus_t status;
-#endif
+  return (SD_CheckStatusWithTimeout(SD_TIMEOUT) == 0) ? RES_OK : RES_ERROR;
 
-#if defined(ENABLE_SCRATCH_BUFFER)
-  int32_t ret;
-#endif
+#if 0 /* DMA/RTOS implementation retained for future high-throughput use. */
 
   /*
   * ensure the SDCard is ready for a new operation
@@ -514,14 +515,14 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 
           if (event.status == osEventMessage)
           {
-            if (event.value.v == READ_CPLT_MSG)
+            if (event.value.v == WRITE_CPLT_MSG)
             {
               timer = osKernelSysTick();
               /* block until SDIO IP is ready or a timeout occur */
               while(osKernelSysTick() - timer <SD_TIMEOUT)
 #else
                 status = osMessageQueueGet(SDQueueID, (void *)&event, NULL, SD_TIMEOUT);
-              if ((status == osOK) && (event == READ_CPLT_MSG))
+              if ((status == osOK) && (event == WRITE_CPLT_MSG))
               {
                 timer = osKernelGetTickCount();
                 /* block until SDIO IP is ready or a timeout occur */
@@ -561,6 +562,7 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 #endif
 
   return res;
+#endif
 }
  #endif /* _USE_WRITE == 1 */
 

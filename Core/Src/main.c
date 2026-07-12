@@ -30,6 +30,11 @@
 
 #include <stdio.h>
 #include <string.h>
+
+#include "fatfs.h"
+#include "ff.h"
+#include "diskio.h"
+#include "bsp_driver_sd.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -242,6 +247,14 @@ static uint8_t appTodayDay = 0U;
 
 static uint32_t appLastPressTick = 0U;
 
+static DSTATUS appSdDiskStatus = STA_NOINIT;
+static uint32_t appSdHalError = 0U;
+static uint32_t appSdHalState = 0U;
+static uint8_t appBspSdInitResult = 0xFFU;
+static uint8_t appBspSdCardState = 0xFFU;
+static BYTE appSdPhysicalDrive = 0xFFU;
+static uint8_t appSdFailStage = 0U;
+
 
 typedef enum
 {
@@ -262,6 +275,9 @@ static uint8_t setupMinute = 0U;
 static uint8_t setupSecond = 0U;
 
 static APP_TimeFieldTypeDef setupField = APP_FIELD_YEAR;
+
+static FIL appSdFile;
+static char appSdFilePath[40];
 
 /* USER CODE END PV */
 
@@ -330,6 +346,9 @@ static uint8_t APP_CalculateWeekDay(
     uint8_t month,
     uint8_t day);
 
+static FRESULT APP_SD_Test(void);
+static void APP_ShowSdTestResult(FRESULT result);
+static void APP_SD_CaptureHalState(void);
 
 /* USER CODE END PFP */
 
@@ -942,6 +961,7 @@ static void APP_TimeSetupScreen(void)
 
 static void APP_Init(void)
 {
+    FRESULT sdResult;
     /*
      * 初始化 LCD。
      */
@@ -985,14 +1005,39 @@ static void APP_Init(void)
         Error_Handler();
     }
 
-/*
- * 每次开机先进入时间设置页面。
- */
 APP_TimeSetupScreen();
-APP_InitTodayState();
+
 /*
- * 保存时间后进入按钮记录页面。
+ * 先显示状态，避免看起来像停在 RTC SAVED。
  */
+BSP_LCD_Clear(LCD_COLOR_WHITE);
+BSP_LCD_SetFont(&Font20);
+BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+BSP_LCD_SetTextColor(LCD_COLOR_BLUE);
+
+BSP_LCD_DisplayStringAt(
+    0U,
+    110U,
+    (uint8_t *)"TESTING SD CARD...",
+    CENTER_MODE
+);
+
+osDelay(100U);
+
+/*
+ * 初始化、挂载并创建 CSV 文件。
+ */
+sdResult = APP_SD_Test();
+
+/*
+ * 显示测试结果。
+ */
+APP_ShowSdTestResult(sdResult);
+
+/*
+ * SD 测试完成后，进入六个奶量按钮界面。
+ */
+APP_InitTodayState();
 APP_DrawInterface();
 
 appLastPressTick =
@@ -1005,11 +1050,7 @@ static void APP_Run(void)
     while (1)
     {
         APP_ProcessTouch();
-
-        /*
-         * 每 10ms 读取一次触摸屏。
-         */
-        HAL_Delay(10);
+        osDelay(10U);
     }
 }
 
@@ -1365,6 +1406,318 @@ static void APP_ProcessTouch(void)
     previousTouching = touching;
 }
 
+static FRESULT APP_SD_Test(void)
+{
+    FRESULT result = FR_OK;
+    FRESULT closeResult = FR_OK;
+    UINT bytesWritten = 0U;
+
+    static const char csvHeader[] =
+        "date,time,amount_ml\r\n";
+
+    appBspSdInitResult = 0xFFU;
+    appBspSdCardState = 0xFFU;
+    appSdDiskStatus = STA_NOINIT;
+    appSdHalError = 0U;
+    appSdHalState = 0U;
+    appSdPhysicalDrive = 0xFFU;
+    appSdFailStage = 0U;
+
+    /*
+     * SDPath 应为 "0:/"。
+     */
+    if ((SDPath[0] < '0') ||
+        (SDPath[0] > '9'))
+    {
+        return FR_INVALID_DRIVE;
+    }
+
+    appSdPhysicalDrive =
+        (BYTE)(SDPath[0] - '0');
+
+    /*
+     * 此处由 sd_diskio.c 内部调用 BSP_SD_Init()。
+     */
+    appSdDiskStatus =
+        disk_initialize(appSdPhysicalDrive);
+
+    osDelay(50U);
+
+    appBspSdCardState =
+        BSP_SD_GetCardState();
+
+    appSdHalError =
+        HAL_SD_GetError(&hsd1);
+
+    appSdHalState =
+        (uint32_t)HAL_SD_GetState(&hsd1);
+
+    /*
+     * BSP 显示值根据磁盘初始化结果记录。
+     */
+    if ((appSdDiskStatus & STA_NOINIT) != 0U)
+    {
+        appBspSdInitResult = MSD_ERROR;
+        appSdFailStage = 1U;
+        APP_SD_CaptureHalState();
+        return FR_NOT_READY;
+    }
+
+    appBspSdInitResult = MSD_OK;
+
+    /*
+     * 挂载文件系统。
+     */
+    appSdFailStage = 2U;
+    result = f_mount(
+        &SDFatFS,
+        (TCHAR const *)SDPath,
+        1U
+    );
+
+    if (result != FR_OK)
+    {
+        APP_SD_CaptureHalState();
+        return result;
+    }
+
+    snprintf(
+        appSdFilePath,
+        sizeof(appSdFilePath),
+        "%sMILKLOG.CSV",
+        SDPath
+    );
+
+    appSdFailStage = 3U;
+    result = f_open(
+        &appSdFile,
+        appSdFilePath,
+        FA_OPEN_ALWAYS | FA_WRITE
+    );
+
+    if (result != FR_OK)
+    {
+        APP_SD_CaptureHalState();
+        (void)f_mount(
+            NULL,
+            (TCHAR const *)SDPath,
+            1U
+        );
+
+        return result;
+    }
+
+    if (f_size(&appSdFile) == 0U)
+    {
+        appSdFailStage = 4U;
+        result = f_write(
+            &appSdFile,
+            csvHeader,
+            sizeof(csvHeader) - 1U,
+            &bytesWritten
+        );
+
+        if ((result == FR_OK) &&
+            (bytesWritten !=
+             (sizeof(csvHeader) - 1U)))
+        {
+            result = FR_DISK_ERR;
+        }
+
+        if (result == FR_OK)
+        {
+            appSdFailStage = 5U;
+            result = f_sync(&appSdFile);
+        }
+
+        if (result != FR_OK)
+        {
+            APP_SD_CaptureHalState();
+        }
+    }
+
+    if (result == FR_OK)
+    {
+        appSdFailStage = 6U;
+    }
+    closeResult =
+        f_close(&appSdFile);
+
+    if (result == FR_OK)
+    {
+        result = closeResult;
+    }
+
+    (void)f_mount(
+        NULL,
+        (TCHAR const *)SDPath,
+        1U
+    );
+
+    APP_SD_CaptureHalState();
+    if (result == FR_OK)
+    {
+        appSdFailStage = 0U;
+    }
+    return result;
+}
+
+static void APP_SD_CaptureHalState(void)
+{
+    appBspSdCardState = BSP_SD_GetCardState();
+    appSdHalError = HAL_SD_GetError(&hsd1);
+    appSdHalState = (uint32_t)HAL_SD_GetState(&hsd1);
+}
+
+static void APP_ShowSdTestResult(FRESULT result)
+{
+    char text[48];
+
+    BSP_LCD_Clear(LCD_COLOR_WHITE);
+
+    /*
+     * 标题。
+     */
+    BSP_LCD_SetFont(&Font20);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+
+    if (result == FR_OK)
+    {
+        BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+
+        BSP_LCD_DisplayStringAt(
+            0U,
+            45U,
+            (uint8_t *)"SD CARD OK",
+            CENTER_MODE
+        );
+    }
+    else
+    {
+        BSP_LCD_SetTextColor(LCD_COLOR_RED);
+
+        BSP_LCD_DisplayStringAt(
+            0U,
+            45U,
+            (uint8_t *)"SD CARD ERROR",
+            CENTER_MODE
+        );
+    }
+
+    /*
+     * 诊断信息。
+     */
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+
+    /*
+     * FatFs 和 BSP 初始化结果。
+     */
+    snprintf(
+        text,
+        sizeof(text),
+        "FatFs: %u  BSP: %u",
+        (unsigned int)result,
+        (unsigned int)appBspSdInitResult
+    );
+
+    BSP_LCD_DisplayStringAt(
+        0U,
+        90U,
+        (uint8_t *)text,
+        CENTER_MODE
+    );
+
+    /*
+     * 磁盘状态和物理盘号。
+     */
+    snprintf(
+        text,
+        sizeof(text),
+        "Disk: %02X Drive:%u Stage:%u",
+        (unsigned int)appSdDiskStatus,
+        (unsigned int)appSdPhysicalDrive,
+        (unsigned int)appSdFailStage
+    );
+
+    BSP_LCD_DisplayStringAt(
+        0U,
+        115U,
+        (uint8_t *)text,
+        CENTER_MODE
+    );
+
+    /*
+     * SD 卡传输状态。
+     */
+    snprintf(
+        text,
+        sizeof(text),
+        "Card state: %u",
+        (unsigned int)appBspSdCardState
+    );
+
+    BSP_LCD_DisplayStringAt(
+        0U,
+        140U,
+        (uint8_t *)text,
+        CENTER_MODE
+    );
+
+    /*
+     * HAL SD 状态。
+     */
+    snprintf(
+        text,
+        sizeof(text),
+        "HAL state: %lu",
+        (unsigned long)appSdHalState
+    );
+
+    BSP_LCD_DisplayStringAt(
+        0U,
+        165U,
+        (uint8_t *)text,
+        CENTER_MODE
+    );
+
+    /*
+     * HAL SD 错误码。
+     */
+    snprintf(
+        text,
+        sizeof(text),
+        "HAL error: 0x%08lX",
+        (unsigned long)appSdHalError
+    );
+
+    BSP_LCD_DisplayStringAt(
+        0U,
+        190U,
+        (uint8_t *)text,
+        CENTER_MODE
+    );
+
+    /*
+     * 显示 SDPath。
+     */
+    snprintf(
+        text,
+        sizeof(text),
+        "Path: %s",
+        SDPath
+    );
+
+    BSP_LCD_DisplayStringAt(
+        0U,
+        215U,
+        (uint8_t *)text,
+        CENTER_MODE
+    );
+
+    HAL_Delay(10000U);
+}
 /* USER CODE END 0 */
 
 /**
@@ -1428,8 +1781,6 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
-APP_Init();
-APP_Run();
 
   /* USER CODE END 2 */
 
@@ -2080,7 +2431,8 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_1B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 0;
+  /* Conservative 8 MHz SD clock for reliable writes on the Discovery socket. */
+  hsd1.Init.ClockDiv = 4;
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
   /* USER CODE END SDMMC1_Init 2 */
@@ -2804,16 +3156,19 @@ static void MX_GPIO_Init(void)
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
-  /* init code for USB_HOST */
-  MX_USB_HOST_Init();
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
+    /* USER CODE BEGIN 5 */
+
+    APP_Init();
+    APP_Run();
+
+    for (;;)
+    {
+        osDelay(10U);
+    }
+
+    /* USER CODE END 5 */
 }
+
 
  /* MPU Configuration */
 

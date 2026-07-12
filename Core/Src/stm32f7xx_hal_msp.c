@@ -985,7 +985,15 @@ void HAL_SD_MspInit(SD_HandleTypeDef* hsd)
     HAL_GPIO_Init(SDMMC_CMD_GPIO_Port, &GPIO_InitStruct);
 
     /* USER CODE BEGIN SDMMC1_MspInit 1 */
+        HAL_NVIC_SetPriority(
+            SDMMC1_IRQn,
+            5U,
+            0U
+        );
 
+        HAL_NVIC_EnableIRQ(
+            SDMMC1_IRQn
+        );
     /* USER CODE END SDMMC1_MspInit 1 */
 
   }
@@ -1022,7 +1030,7 @@ void HAL_SD_MspDeInit(SD_HandleTypeDef* hsd)
     HAL_GPIO_DeInit(SDMMC_CMD_GPIO_Port, SDMMC_CMD_Pin);
 
     /* USER CODE BEGIN SDMMC1_MspDeInit 1 */
-
+    HAL_NVIC_DisableIRQ(SDMMC1_IRQn);
     /* USER CODE END SDMMC1_MspDeInit 1 */
   }
 

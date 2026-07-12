@@ -29,4 +29,5 @@ uint8_t	BSP_PlatformIsDetected(void) {
     /* user code can be inserted here */
     /* USER CODE END 1 */
     return status;
+    // return SD_PRESENT;
 }
