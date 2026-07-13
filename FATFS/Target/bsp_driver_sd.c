@@ -55,14 +55,11 @@ __weak uint8_t BSP_SD_Init(void)
   }
   /* HAL SD initialization */
   sd_state = HAL_SD_Init(&hsd1);
-  /* Keep 1-bit mode: it provides the best signal margin for log writes. */
-  if (sd_state == MSD_OK)
-  {
-    if (HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_1B) != HAL_OK)
-    {
-      sd_state = MSD_ERROR;
-    }
-  }
+  /*
+   * hsd1.Init.BusWide is already SDMMC_BUS_WIDE_1B.  Calling
+   * HAL_SD_ConfigWideBusOperation(...1B) again sends an unnecessary card
+   * command and can return SDMMC_ERROR_BUSY immediately after reinsertion.
+   */
 
   return sd_state;
 }

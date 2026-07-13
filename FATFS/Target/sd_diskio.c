@@ -31,6 +31,8 @@
 #include <string.h>
 #include <stdio.h>
 
+extern SD_HandleTypeDef hsd1;
+
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 
@@ -138,6 +140,13 @@ const Diskio_drvTypeDef  SD_Driver =
 static int SD_CheckStatusWithTimeout(uint32_t timeout)
 {
   uint32_t timer;
+
+  if ((BSP_SD_IsDetected() != SD_PRESENT) ||
+      (HAL_SD_GetState(&hsd1) != HAL_SD_STATE_READY))
+  {
+    return -1;
+  }
+
   /* block until SDIO peripheral is ready again or a timeout occur */
 #if (osCMSIS <= 0x20000U)
   timer = osKernelSysTick();
@@ -147,10 +156,13 @@ static int SD_CheckStatusWithTimeout(uint32_t timeout)
   while( osKernelGetTickCount() - timer < timeout)
 #endif
   {
-    if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
+    if ((BSP_SD_IsDetected() == SD_PRESENT) &&
+        (HAL_SD_GetState(&hsd1) == HAL_SD_STATE_READY) &&
+        (BSP_SD_GetCardState() == SD_TRANSFER_OK))
     {
       return 0;
     }
+
   }
 
   return -1;
@@ -160,7 +172,9 @@ static DSTATUS SD_CheckStatus(BYTE lun)
 {
   Stat = STA_NOINIT;
 
-  if(BSP_SD_GetCardState() == SD_TRANSFER_OK)
+  if((BSP_SD_IsDetected() == SD_PRESENT) &&
+     (HAL_SD_GetState(&hsd1) == HAL_SD_STATE_READY) &&
+     (BSP_SD_GetCardState() == SD_TRANSFER_OK))
   {
     Stat &= ~STA_NOINIT;
   }

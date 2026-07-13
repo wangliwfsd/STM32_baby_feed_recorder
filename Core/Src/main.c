@@ -88,6 +88,14 @@
 #define APP_SYNC_CANCEL_Y             185U
 #define APP_SYNC_CANCEL_WIDTH         140U
 #define APP_SYNC_CANCEL_HEIGHT         55U
+#define APP_PENDING_MAX_RECORDS        32U
+#define APP_SD_RETRY_MS               500U
+#define APP_SD_STEP_DELAY_MS            20U
+#define APP_SD_INTERWRITE_MS           500U
+#define APP_SD_REINSERT_STABLE_MS      500U
+#define APP_SD_POST_RECOVERY_MS        200U
+#define APP_SD_DIRECT_FAILURE_LIMIT      3U
+#define APP_COLOR_PENDING      0xFFFF8C00U
 
 #define RTC_INIT_MAGIC             0x32F3U
 
@@ -151,6 +159,10 @@ SDRAM_HandleTypeDef hsdram1;
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 
+static osThreadId appStorageTaskHandle;
+static osMailQId appStorageQueue;
+static osMessageQId appStorageDoneQueue;
+
 static TS_StateTypeDef appTouchState;
 
 typedef struct
@@ -177,7 +189,13 @@ typedef struct
 
     uint16_t amountMl;
     uint32_t sourceOrdinal;
+    uint32_t recordId;
+    uint8_t pending;
 } APP_MilkRecordTypeDef;
+
+osMailQDef(AppStorageMail, APP_PENDING_MAX_RECORDS,
+           APP_MilkRecordTypeDef);
+osMessageQDef(AppStorageDone, APP_PENDING_MAX_RECORDS, uint32_t);
 
 
 /*
@@ -245,6 +263,14 @@ static uint16_t appRecordCount = 0U;
 static uint16_t appHistoryPage = 0U;
 static int16_t appSelectedRecordIndex = -1;
 static uint32_t appCsvRecordCount = 0U;
+static uint32_t appNextRecordId = 0U;
+static uint8_t appPendingCount = 0U;
+static volatile uint8_t appStorageFault = 0U;
+static volatile uint8_t appStorageQueueFull = 0U;
+static volatile FRESULT appStorageLastResult = FR_OK;
+static volatile uint32_t appStorageStatusVersion = 0U;
+static volatile uint8_t appStorageWriteStage = 0U;
+static volatile uint8_t appSdRemovalSeen = 0U;
 static uint32_t appTodayTotalMl = 0U;
 
 static uint16_t appTodayYear = 0U;
@@ -260,7 +286,7 @@ static uint8_t appBspSdInitResult = 0xFFU;
 static uint8_t appBspSdCardState = 0xFFU;
 static BYTE appSdPhysicalDrive = 0xFFU;
 static uint8_t appSdFailStage = 0U;
-static uint8_t appSdReady = 0U;
+static volatile uint8_t appSdReady = 0U;
 static struct netif appNetif;
 static volatile uint8_t appTimeSynchronized = 0U;
 static uint8_t appNetworkInitialized = 0U;
@@ -319,6 +345,7 @@ static void MX_TIM12_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 void StartDefaultTask(void const * argument);
+static void APP_StorageTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -334,6 +361,7 @@ static uint8_t APP_SyncCancelRequested(void);
 static void APP_DrawInterface(void);
 static void APP_DrawLeftPanel(void);
 static void APP_DrawCurrentTime(uint8_t force);
+static void APP_DrawSdStatus(uint8_t force);
 
 static void APP_DrawMilkButton(
     uint8_t buttonIndex,
@@ -344,6 +372,9 @@ static void APP_DrawAllMilkButtons(void);
 static void APP_InitTodayState(void);
 static void APP_AddMilkRecord(uint16_t amountMl);
 static FRESULT APP_AppendMilkRecord(const APP_MilkRecordTypeDef *record);
+static FRESULT APP_RecoverCsvUpgrade(void);
+static FRESULT APP_RecoverSd(void);
+static void APP_ProcessStorageEvents(void);
 static FRESULT APP_LoadTodayRecords(void);
 static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record);
 static FRESULT APP_DeleteRecord(uint32_t sourceOrdinal);
@@ -574,6 +605,8 @@ static void APP_InitTodayState(void)
     appHistoryPage = 0U;
     appSelectedRecordIndex = -1;
     appCsvRecordCount = 0U;
+    appNextRecordId = 0U;
+    appPendingCount = 0U;
 }
 
 
@@ -1017,7 +1050,7 @@ static FRESULT APP_ClearAllHistory(void)
     FIL file;
     FRESULT result;
     UINT written = 0U;
-    static const char header[] = "date,time,amount_ml\r\n";
+    static const char header[] = "date,time,amount_ml,record_id\r\n";
 
     if (appSdReady == 0U)
     {
@@ -1488,8 +1521,19 @@ static void APP_Run(void)
 {
     while (1)
     {
+        if (BSP_SD_IsDetected() != SD_PRESENT)
+        {
+            appSdRemovalSeen = 1U;
+            if (appSdReady != 0U)
+            {
+                appSdReady = 0U;
+                appStorageStatusVersion++;
+            }
+        }
+        APP_ProcessStorageEvents();
         APP_ProcessTouch();
         APP_DrawCurrentTime(0U);
+        APP_DrawSdStatus(0U);
         osDelay(10U);
     }
 }
@@ -1515,12 +1559,7 @@ static void APP_DrawInterface(void)
 
     APP_DrawCurrentTime(1U);
 
-    BSP_LCD_SetFont(&Font16);
-    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
-    BSP_LCD_SetTextColor((appSdReady != 0U) ?
-                         LCD_COLOR_GREEN : LCD_COLOR_RED);
-    BSP_LCD_DisplayStringAt(442U, 5U,
-                            (uint8_t *)"SD", LEFT_MODE);
+    APP_DrawSdStatus(1U);
 }
 
 static void APP_GetHistoryPageRange(uint16_t *firstIndex,
@@ -1599,6 +1638,57 @@ static void APP_DrawCurrentTime(uint8_t force)
     BSP_LCD_DisplayStringAt(300U, 5U, (uint8_t *)text, LEFT_MODE);
 }
 
+static void APP_DrawSdStatus(uint8_t force)
+{
+    static uint32_t lastVersion = 0xFFFFFFFFU;
+    static uint8_t lastPending = 0xFFU;
+    char text[11];
+    uint32_t color;
+
+    if ((force == 0U) &&
+        (lastVersion == appStorageStatusVersion) &&
+        (lastPending == appPendingCount))
+    {
+        return;
+    }
+
+    lastVersion = appStorageStatusVersion;
+    lastPending = appPendingCount;
+
+    if (appStorageQueueFull != 0U)
+    {
+        snprintf(text, sizeof(text), "QUEUE FULL");
+        color = LCD_COLOR_RED;
+    }
+    else if (appStorageFault != 0U)
+    {
+        snprintf(text, sizeof(text), "WAIT P:%u", appPendingCount);
+        color = APP_COLOR_PENDING;
+    }
+    else if (appPendingCount != 0U)
+    {
+        snprintf(text, sizeof(text), "SAVE P:%u", appPendingCount);
+        color = APP_COLOR_PENDING;
+    }
+    else if (appSdReady != 0U)
+    {
+        snprintf(text, sizeof(text), "SD OK");
+        color = LCD_COLOR_GREEN;
+    }
+    else
+    {
+        snprintf(text, sizeof(text), "SD ERROR");
+        color = LCD_COLOR_RED;
+    }
+
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_FillRect(400U, 2U, 80U, 22U);
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    BSP_LCD_SetTextColor(color);
+    BSP_LCD_DisplayStringAt(400U, 5U, (uint8_t *)text, LEFT_MODE);
+}
+
 static void APP_DrawLeftPanel(void)
 {
     char text[40];
@@ -1611,6 +1701,7 @@ static void APP_DrawLeftPanel(void)
     uint8_t displayDay = appTodayDay;
     uint32_t displayTotal = 0U;
     uint16_t displayFeeds = 0U;
+    uint16_t displayPending = 0U;
     const APP_MilkRecordTypeDef *displayLast = NULL;
 
     APP_GetHistoryPageRange(&firstIndex, &endIndex, &totalPages);
@@ -1638,6 +1729,10 @@ static void APP_DrawLeftPanel(void)
             {
                 displayTotal += appMilkRecords[j].amountMl;
                 displayFeeds++;
+                if (appMilkRecords[j].pending != 0U)
+                {
+                    displayPending++;
+                }
                 displayLast = &appMilkRecords[j];
             }
         }
@@ -1678,9 +1773,10 @@ static void APP_DrawLeftPanel(void)
     snprintf(
         text,
         sizeof(text),
-        "Total:%lu ml  Feeds:%u",
+        "Total:%lu ml F:%u P:%u",
         (unsigned long)displayTotal,
-        (unsigned int)displayFeeds
+        (unsigned int)displayFeeds,
+        (unsigned int)displayPending
     );
 
     BSP_LCD_DisplayStringAt(
@@ -1722,15 +1818,19 @@ static void APP_DrawLeftPanel(void)
         BSP_LCD_SetBackColor(
             ((int16_t)recordIndex == appSelectedRecordIndex) ?
             LCD_COLOR_YELLOW : LCD_COLOR_WHITE);
+        BSP_LCD_SetTextColor(
+            (appMilkRecords[recordIndex].pending != 0U) ?
+            APP_COLOR_PENDING : LCD_COLOR_BLACK);
         snprintf(
             text,
             sizeof(text),
-            "%02u-%02u %02u:%02u  %3u ml",
+            "%02u-%02u %02u:%02u  %3u ml%s",
             appMilkRecords[recordIndex].month,
             appMilkRecords[recordIndex].day,
             appMilkRecords[recordIndex].hour,
             appMilkRecords[recordIndex].minute,
-            appMilkRecords[recordIndex].amountMl
+            appMilkRecords[recordIndex].amountMl,
+            (appMilkRecords[recordIndex].pending != 0U) ? " *" : ""
         );
 
         BSP_LCD_DisplayStringAt(
@@ -1748,8 +1848,12 @@ static void APP_DrawLeftPanel(void)
 
 static void APP_DrawDeleteButton(void)
 {
-    uint32_t color = (appSelectedRecordIndex >= 0) ?
-        LCD_COLOR_RED : LCD_COLOR_GRAY;
+    uint8_t canDelete =
+        ((appSelectedRecordIndex >= 0) &&
+         (appMilkRecords[appSelectedRecordIndex].pending == 0U) &&
+         (appPendingCount == 0U) &&
+         (appStorageFault == 0U)) ? 1U : 0U;
+    uint32_t color = (canDelete != 0U) ? LCD_COLOR_RED : LCD_COLOR_GRAY;
 
     BSP_LCD_SetTextColor(color);
     BSP_LCD_FillRect(APP_DELETE_X, APP_DELETE_Y,
@@ -1849,6 +1953,7 @@ static void APP_AddMilkRecord(uint16_t amountMl)
 
     uint16_t currentYear;
     APP_MilkRecordTypeDef record;
+    APP_MilkRecordTypeDef *queuedRecord;
 
     if (HAL_RTC_GetTime(
             &hrtc,
@@ -1890,18 +1995,47 @@ static void APP_AddMilkRecord(uint16_t amountMl)
     record.minute = rtcTime.Minutes;
     record.second = rtcTime.Seconds;
     record.amountMl = amountMl;
+    record.sourceOrdinal = 0U;
+    record.pending = 1U;
 
-    /* Only show a record after it is safely synchronized to the SD card. */
-    if (APP_AppendMilkRecord(&record) != FR_OK)
+    if (appPendingCount >= APP_PENDING_MAX_RECORDS)
     {
+        appStorageQueueFull = 1U;
+        appStorageStatusVersion++;
         return;
     }
 
-    record.sourceOrdinal = ++appCsvRecordCount;
+    appNextRecordId++;
+    if (appNextRecordId == 0U)
+    {
+        appNextRecordId = 1U;
+    }
+    record.recordId = appNextRecordId;
+
+    queuedRecord = osMailAlloc(appStorageQueue, 0U);
+    if (queuedRecord == NULL)
+    {
+        appStorageQueueFull = 1U;
+        appStorageStatusVersion++;
+        return;
+    }
+    *queuedRecord = record;
+    if (osMailPut(appStorageQueue, queuedRecord) != osOK)
+    {
+        (void)osMailFree(appStorageQueue, queuedRecord);
+        appStorageQueueFull = 1U;
+        appStorageStatusVersion++;
+        return;
+    }
+
+    appPendingCount++;
+    appStorageQueueFull = 0U;
+    appStorageStatusVersion++;
     APP_InsertTodayRecord(&record);
     appHistoryPage = 0U;
 
     APP_DrawLeftPanel();
+    APP_DrawDeleteButton();
 }
 
 static void APP_InsertTodayRecord(const APP_MilkRecordTypeDef *record)
@@ -1935,55 +2069,298 @@ static FRESULT APP_AppendMilkRecord(const APP_MilkRecordTypeDef *record)
     FIL file;
     FRESULT result;
     UINT bytesWritten = 0U;
-    char line[48];
+    char line[64];
     int length;
     uint8_t fileOpen = 0U;
 
     length = snprintf(line, sizeof(line),
-                      "%04u-%02u-%02u,%02u:%02u:%02u,%u\r\n",
+                      "%04u-%02u-%02u,%02u:%02u:%02u,%u,%lu\r\n",
                       record->year, record->month, record->day,
                       record->hour, record->minute, record->second,
-                      record->amountMl);
+                      record->amountMl,
+                      (unsigned long)record->recordId);
     if ((length <= 0) || ((size_t)length >= sizeof(line)))
     {
         return FR_INVALID_PARAMETER;
     }
 
+    appStorageWriteStage = 1U;
     result = f_open(&file, appSdFilePath, FA_OPEN_ALWAYS | FA_WRITE);
     if (result == FR_OK)
     {
         fileOpen = 1U;
-        result = f_lseek(&file, f_size(&file));
+        osDelay(APP_SD_STEP_DELAY_MS);
     }
     if (result == FR_OK)
     {
+        appStorageWriteStage = 2U;
+        result = f_lseek(&file, f_size(&file));
+        if (result == FR_OK)
+        {
+            osDelay(APP_SD_STEP_DELAY_MS);
+        }
+    }
+    if (result == FR_OK)
+    {
+        appStorageWriteStage = 3U;
         result = f_write(&file, line, (UINT)length, &bytesWritten);
         if ((result == FR_OK) && (bytesWritten != (UINT)length))
         {
             result = FR_DISK_ERR;
         }
+        if (result == FR_OK)
+        {
+            osDelay(APP_SD_STEP_DELAY_MS);
+        }
     }
-    if (result == FR_OK)
-    {
-        result = f_sync(&file);
-    }
-
     if (fileOpen != 0U)
     {
+        appStorageWriteStage = 4U;
         FRESULT closeResult = f_close(&file);
         if (result == FR_OK)
         {
             result = closeResult;
         }
+        if (result == FR_OK)
+        {
+            osDelay(APP_SD_STEP_DELAY_MS);
+        }
+    }
+    if (result == FR_OK)
+    {
+        appStorageWriteStage = 0U;
     }
     return result;
+}
+
+static FRESULT APP_RecoverCsvUpgrade(void)
+{
+    FILINFO info;
+    FRESULT mainStatus;
+    FRESULT tempStatus;
+    FRESULT backupStatus;
+    char tempPath[24];
+    char backupPath[24];
+
+    snprintf(tempPath, sizeof(tempPath), "%sMILKUPG.CSV", SDPath);
+    snprintf(backupPath, sizeof(backupPath), "%sMILKOLD.CSV", SDPath);
+    mainStatus = f_stat(appSdFilePath, &info);
+    tempStatus = f_stat(tempPath, &info);
+    backupStatus = f_stat(backupPath, &info);
+
+    if (mainStatus == FR_OK)
+    {
+        if (tempStatus == FR_OK)
+        {
+            (void)f_unlink(tempPath);
+        }
+        if (backupStatus == FR_OK)
+        {
+            (void)f_unlink(backupPath);
+        }
+        return FR_OK;
+    }
+    if (mainStatus != FR_NO_FILE)
+    {
+        return mainStatus;
+    }
+
+    if (tempStatus == FR_OK)
+    {
+        FRESULT result = f_rename(tempPath, appSdFilePath);
+        if (result == FR_OK)
+        {
+            (void)f_unlink(backupPath);
+        }
+        return result;
+    }
+    if (backupStatus == FR_OK)
+    {
+        return f_rename(backupPath, appSdFilePath);
+    }
+    return FR_OK;
+}
+
+static FRESULT APP_RecoverSd(void)
+{
+    FRESULT result;
+
+    /*
+     * A newly inserted card starts from its own power-on protocol state while
+     * SDMMC may still contain the state of the removed card.  A FatFs remount
+     * alone cannot repair that mismatch, so reset the host peripheral before
+     * asking disk_initialize() to negotiate with the card again.
+     */
+    (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
+    if (BSP_SD_IsDetected() != SD_PRESENT)
+    {
+        appBspSdCardState = 0xFFU;
+        appSdHalState = (uint32_t)HAL_SD_GetState(&hsd1);
+        appSdHalError = HAL_SD_GetError(&hsd1);
+        return FR_NOT_READY;
+    }
+
+    /* Debounce the socket and allow all card contacts/power to settle. */
+    osDelay(APP_SD_REINSERT_STABLE_MS);
+    if (BSP_SD_IsDetected() != SD_PRESENT)
+    {
+        return FR_NOT_READY;
+    }
+
+    if (HAL_SD_DeInit(&hsd1) != HAL_OK)
+    {
+        APP_SD_CaptureHalState();
+        return FR_DISK_ERR;
+    }
+    osDelay(50U);
+
+    appBspSdInitResult = BSP_SD_Init();
+    if ((appBspSdInitResult != MSD_OK) ||
+        (HAL_SD_GetState(&hsd1) != HAL_SD_STATE_READY))
+    {
+        APP_SD_CaptureHalState();
+        return FR_NOT_READY;
+    }
+
+    appSdDiskStatus = disk_status(appSdPhysicalDrive);
+    if ((appSdDiskStatus & STA_NOINIT) != 0U)
+    {
+        APP_SD_CaptureHalState();
+        return FR_NOT_READY;
+    }
+
+    result = f_mount(&SDFatFS, (TCHAR const *)SDPath, 1U);
+    APP_SD_CaptureHalState();
+    return result;
+}
+
+static void APP_ProcessStorageEvents(void)
+{
+    osEvent event;
+    uint8_t redraw = 0U;
+
+    do
+    {
+        uint32_t recordId;
+        uint16_t i;
+
+        event = osMessageGet(appStorageDoneQueue, 0U);
+        if (event.status != osEventMessage)
+        {
+            break;
+        }
+
+        recordId = event.value.v;
+        for (i = 0U; i < appRecordCount; i++)
+        {
+            if ((appMilkRecords[i].recordId == recordId) &&
+                (appMilkRecords[i].pending != 0U))
+            {
+                appMilkRecords[i].pending = 0U;
+                appMilkRecords[i].sourceOrdinal = ++appCsvRecordCount;
+                redraw = 1U;
+                break;
+            }
+        }
+        if (appPendingCount > 0U)
+        {
+            appPendingCount--;
+        }
+        appStorageQueueFull = 0U;
+        appStorageStatusVersion++;
+    } while (1);
+
+    if (redraw != 0U)
+    {
+        APP_DrawLeftPanel();
+        APP_DrawDeleteButton();
+    }
+}
+
+static void APP_StorageTask(void const *argument)
+{
+    (void)argument;
+
+    for (;;)
+    {
+        osEvent event = osMailGet(appStorageQueue, osWaitForever);
+
+        if (event.status == osEventMail)
+        {
+            APP_MilkRecordTypeDef record =
+                *(APP_MilkRecordTypeDef *)event.value.p;
+            FRESULT result;
+            uint8_t directFailureCount = 0U;
+
+            (void)osMailFree(appStorageQueue, event.value.p);
+
+            for (;;)
+            {
+                result = APP_AppendMilkRecord(&record);
+                if (result == FR_OK)
+                {
+                    appStorageLastResult = FR_OK;
+                    appStorageFault = 0U;
+                    appSdReady = 1U;
+                    appSdRemovalSeen = 0U;
+                    appStorageStatusVersion++;
+                    (void)osMessagePut(appStorageDoneQueue,
+                                       record.recordId,
+                                       osWaitForever);
+                    /* Give the card a short quiet period before the FIFO's
+                       next open/read/write transaction. */
+                    osDelay(APP_SD_INTERWRITE_MS);
+                    break;
+                }
+
+                APP_SD_CaptureHalState();
+                appStorageLastResult = result;
+                appStorageFault = 1U;
+                appSdReady = 0U;
+                appStorageStatusVersion++;
+
+                if (BSP_SD_IsDetected() != SD_PRESENT)
+                {
+                    appSdRemovalSeen = 1U;
+                    directFailureCount = 0U;
+                }
+
+                osDelay(APP_SD_RETRY_MS);
+                if (BSP_SD_IsDetected() != SD_PRESENT)
+                {
+                    appStorageLastResult = FR_NOT_READY;
+                    appStorageStatusVersion++;
+                    continue;
+                }
+
+                directFailureCount++;
+                if ((appSdRemovalSeen != 0U) ||
+                    (directFailureCount >= APP_SD_DIRECT_FAILURE_LIMIT))
+                {
+
+                    result = APP_RecoverSd();
+                    if (result != FR_OK)
+                    {
+                        appStorageLastResult = result;
+                        appStorageStatusVersion++;
+                        continue;
+                    }
+
+                    appSdRemovalSeen = 0U;
+                    directFailureCount = 0U;
+                    /* Let the reinitialized card settle before f_open(). */
+                    osDelay(APP_SD_POST_RECOVERY_MS);
+                }
+            }
+        }
+    }
 }
 
 static FRESULT APP_LoadTodayRecords(void)
 {
     FIL file;
     FRESULT result;
-    char line[64];
+    char line[96];
 
     result = f_open(&file, appSdFilePath, FA_READ);
     if (result != FR_OK)
@@ -1997,10 +2374,13 @@ static FRESULT APP_LoadTodayRecords(void)
     {
         APP_MilkRecordTypeDef record;
         unsigned int year, month, day, hour, minute, second, amount;
+        unsigned long recordId = 0UL;
+        int fields;
 
-        if (sscanf(line, "%u-%u-%u,%u:%u:%u,%u",
-                   &year, &month, &day, &hour, &minute, &second,
-                   &amount) != 7)
+        fields = sscanf(line, "%u-%u-%u,%u:%u:%u,%u,%lu",
+                        &year, &month, &day, &hour, &minute, &second,
+                        &amount, &recordId);
+        if (fields < 7)
         {
             continue;
         }
@@ -2019,7 +2399,13 @@ static FRESULT APP_LoadTodayRecords(void)
         record.minute = (uint8_t)minute;
         record.second = (uint8_t)second;
         record.amountMl = (uint16_t)amount;
+        record.recordId = (fields >= 8) ? (uint32_t)recordId : 0U;
+        record.pending = 0U;
         record.sourceOrdinal = ++appCsvRecordCount;
+        if (record.recordId > appNextRecordId)
+        {
+            appNextRecordId = record.recordId;
+        }
         APP_InsertTodayRecord(&record);
     }
 
@@ -2171,6 +2557,9 @@ static void APP_ProcessTouch(void)
             APP_TOUCH_DEBOUNCE_MS)
         {
             if ((appSelectedRecordIndex >= 0) &&
+                (appMilkRecords[appSelectedRecordIndex].pending == 0U) &&
+                (appPendingCount == 0U) &&
+                (appStorageFault == 0U) &&
                 (APP_PointInRect(touchX, touchY, APP_DELETE_X,
                                  APP_DELETE_Y, APP_DELETE_WIDTH,
                                  APP_DELETE_HEIGHT) != 0U))
@@ -2298,7 +2687,7 @@ static FRESULT APP_SD_Test(void)
     UINT bytesWritten = 0U;
 
     static const char csvHeader[] =
-        "date,time,amount_ml\r\n";
+        "date,time,amount_ml,record_id\r\n";
 
     appBspSdInitResult = 0xFFU;
     appBspSdCardState = 0xFFU;
@@ -2373,6 +2762,13 @@ static FRESULT APP_SD_Test(void)
         SDPath
     );
 
+    result = APP_RecoverCsvUpgrade();
+    if (result != FR_OK)
+    {
+        APP_SD_CaptureHalState();
+        return result;
+    }
+
     appSdFailStage = 3U;
     result = f_open(
         &appSdFile,
@@ -2443,9 +2839,20 @@ static FRESULT APP_SD_Test(void)
 
 static void APP_SD_CaptureHalState(void)
 {
-    appBspSdCardState = BSP_SD_GetCardState();
-    appSdHalError = HAL_SD_GetError(&hsd1);
     appSdHalState = (uint32_t)HAL_SD_GetState(&hsd1);
+    appSdHalError = HAL_SD_GetError(&hsd1);
+
+    /*
+     * Do not send CMD13 merely to collect diagnostics after an I/O failure.
+     * The extra command can overwrite the original HAL error and disturb the
+     * retry path.  Explicit disk status checks update appBspSdCardState where
+     * they are actually required.
+     */
+    if ((BSP_SD_IsDetected() != SD_PRESENT) ||
+        (appSdHalState != (uint32_t)HAL_SD_STATE_READY))
+    {
+        appBspSdCardState = 0xFFU;
+    }
 }
 
 static void APP_ShowSdTestResult(FRESULT result)
@@ -2676,7 +3083,13 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  appStorageQueue = osMailCreate(osMailQ(AppStorageMail), NULL);
+  appStorageDoneQueue =
+      osMessageCreate(osMessageQ(AppStorageDone), NULL);
+  if ((appStorageQueue == NULL) || (appStorageDoneQueue == NULL))
+  {
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -2685,7 +3098,13 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  osThreadDef(storageTask, APP_StorageTask, osPriorityAboveNormal, 0, 3072);
+  appStorageTaskHandle =
+      osThreadCreate(osThread(storageTask), NULL);
+  if (appStorageTaskHandle == NULL)
+  {
+    Error_Handler();
+  }
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
