@@ -111,6 +111,9 @@
 #define APP_COLOR_PENDING      0xFFFF8C00U
 
 #define RTC_INIT_MAGIC             0x32F3U
+#define APP_DEFAULT_YEAR             2026U
+#define APP_DEFAULT_MONTH               7U
+#define APP_DEFAULT_DAY                13U
 
 #define SET_MINUS_X          10U
 #define SET_PLUS_X           125U
@@ -304,6 +307,11 @@ static volatile uint8_t appSdReady = 0U;
 static struct netif appNetif;
 static volatile uint8_t appTimeSynchronized = 0U;
 static uint8_t appNetworkInitialized = 0U;
+static volatile uint8_t appTcpipReady = 0U;
+static uint8_t appTcpipInitStarted = 0U;
+static uint8_t appNetworkInitFailed = 0U;
+static uint8_t appNetifAdded = 0U;
+static osThreadId appEthLinkTaskHandle = NULL;
 
 
 typedef enum
@@ -317,9 +325,9 @@ typedef enum
     APP_FIELD_COUNT
 } APP_TimeFieldTypeDef;
 
-static uint16_t setupYear = 2026U;
-static uint8_t setupMonth = 1U;
-static uint8_t setupDay = 1U;
+static uint16_t setupYear = APP_DEFAULT_YEAR;
+static uint8_t setupMonth = APP_DEFAULT_MONTH;
+static uint8_t setupDay = APP_DEFAULT_DAY;
 static uint8_t setupHour = 0U;
 static uint8_t setupMinute = 0U;
 static uint8_t setupSecond = 0U;
@@ -368,7 +376,8 @@ static void APP_Run(void);
 static void APP_BootMenu(void);
 static FRESULT APP_ClearAllHistory(void);
 static uint8_t APP_ConfirmClearHistory(void);
-static void APP_NetworkInit(void);
+static uint8_t APP_NetworkInit(void);
+static void APP_TcpipInitDone(void *argument);
 static uint8_t APP_SyncNetworkTime(void);
 static uint8_t APP_SyncCancelRequested(void);
 
@@ -580,9 +589,9 @@ static void APP_LoadRtcTime(void)
     /*
      * RTC 尚未设置时使用默认值。
      */
-    setupYear = 2026U;
-    setupMonth = 1U;
-    setupDay = 1U;
+    setupYear = APP_DEFAULT_YEAR;
+    setupMonth = APP_DEFAULT_MONTH;
+    setupDay = APP_DEFAULT_DAY;
     setupHour = 0U;
     setupMinute = 0U;
     setupSecond = 0U;
@@ -1197,31 +1206,79 @@ void APP_SNTP_SetUnixTime(unsigned long seconds)
     }
 }
 
-static void APP_NetworkInit(void)
+static void APP_TcpipInitDone(void *argument)
+{
+    (void)argument;
+    appTcpipReady = 1U;
+}
+
+static uint8_t APP_NetworkInit(void)
 {
     ip_addr_t ipaddr;
     ip_addr_t netmask;
     ip_addr_t gateway;
+    uint32_t started;
 
     if (appNetworkInitialized != 0U)
     {
-        return;
+        return 1U;
     }
 
-    ip_addr_set_zero_ip4(&ipaddr);
-    ip_addr_set_zero_ip4(&netmask);
-    ip_addr_set_zero_ip4(&gateway);
-    tcpip_init(NULL, NULL);
-    netif_add(&appNetif, &ipaddr, &netmask, &gateway, NULL,
-              ethernetif_init, tcpip_input);
-    netif_set_default(&appNetif);
-    netif_set_up(&appNetif);
+    appNetworkInitFailed = 0U;
 
-    osThreadDef(EthLink, ethernet_link_thread, osPriorityNormal, 0,
-                configMINIMAL_STACK_SIZE * 2U);
-    (void)osThreadCreate(osThread(EthLink), &appNetif);
-    (void)netifapi_dhcp_start(&appNetif);
+    if (appTcpipInitStarted == 0U)
+    {
+        appTcpipInitStarted = 1U;
+        tcpip_init(APP_TcpipInitDone, NULL);
+    }
+
+    started = HAL_GetTick();
+    while ((appTcpipReady == 0U) &&
+           ((HAL_GetTick() - started) < 3000U))
+    {
+        osDelay(10U);
+    }
+    if (appTcpipReady == 0U)
+    {
+        appNetworkInitFailed = 1U;
+        return 0U;
+    }
+
+    if (appNetifAdded == 0U)
+    {
+        ip_addr_set_zero_ip4(&ipaddr);
+        ip_addr_set_zero_ip4(&netmask);
+        ip_addr_set_zero_ip4(&gateway);
+        if (netif_add(&appNetif, &ipaddr, &netmask, &gateway, NULL,
+                      ethernetif_init, tcpip_input) == NULL)
+        {
+            appNetworkInitFailed = 1U;
+            return 0U;
+        }
+        netif_set_default(&appNetif);
+        netif_set_up(&appNetif);
+        appNetifAdded = 1U;
+    }
+
+    if (appEthLinkTaskHandle == NULL)
+    {
+        osThreadDef(EthLink, ethernet_link_thread, osPriorityNormal, 0,
+                    configMINIMAL_STACK_SIZE * 2U);
+        appEthLinkTaskHandle =
+            osThreadCreate(osThread(EthLink), &appNetif);
+        if (appEthLinkTaskHandle == NULL)
+        {
+            appNetworkInitFailed = 1U;
+            return 0U;
+        }
+    }
+    if (netifapi_dhcp_start(&appNetif) != ERR_OK)
+    {
+        appNetworkInitFailed = 1U;
+        return 0U;
+    }
     appNetworkInitialized = 1U;
+    return 1U;
 }
 
 static uint8_t APP_SyncCancelRequested(void)
@@ -1245,7 +1302,22 @@ static uint8_t APP_SyncNetworkTime(void)
     uint32_t started;
     TS_StateTypeDef state = {0};
 
-    APP_NetworkInit();
+    if (APP_NetworkInit() == 0U)
+    {
+        return 0U;
+    }
+
+    /* A previous cable/DHCP timeout may leave the client waiting in an old
+       state.  Start a fresh DHCP transaction whenever a retry has no IP. */
+    if (ip4_addr_isany_val(*netif_ip4_addr(&appNetif)))
+    {
+        (void)netifapi_dhcp_stop(&appNetif);
+        if (netifapi_dhcp_start(&appNetif) != ERR_OK)
+        {
+            appNetworkInitFailed = 1U;
+            return 0U;
+        }
+    }
 
     /* Do not treat the menu tap that opened this page as CANCEL. */
     do
@@ -1338,7 +1410,14 @@ static void APP_BootMenu(void)
 
         BSP_LCD_SetFont(&Font16);
         BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
-        if (appNetworkInitialized == 0U)
+        if (appNetworkInitFailed != 0U)
+        {
+            snprintf(connectionStatus, sizeof(connectionStatus),
+                     "%s   NET: INIT ERROR",
+                     (appSdReady != 0U) ? "SD: OK" : "SD: ERROR");
+            BSP_LCD_SetTextColor(LCD_COLOR_RED);
+        }
+        else if (appNetworkInitialized == 0U)
         {
             snprintf(connectionStatus, sizeof(connectionStatus),
                      "%s   NET: OFF",

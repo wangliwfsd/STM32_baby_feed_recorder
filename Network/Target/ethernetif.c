@@ -142,7 +142,7 @@ lan8742_IOCtx_t  LAN8742_IOCtx = {ETH_PHY_IO_Init,
   * @param netif the already initialized lwip network interface structure
   *        for this ethernetif
   */
-static void low_level_init(struct netif *netif)
+static err_t low_level_init(struct netif *netif)
 {
   uint32_t duplex, speed = 0;
   int32_t PHYLinkState = 0;
@@ -157,7 +157,10 @@ static void low_level_init(struct netif *netif)
   EthHandle.Init.RxBuffLen = ETH_RX_BUF_SIZE;
 
   /* configure ethernet peripheral (GPIOs, clocks, MAC, DMA) */
-  HAL_ETH_Init(&EthHandle);
+  if (HAL_ETH_Init(&EthHandle) != HAL_OK)
+  {
+    return ERR_IF;
+  }
 
   /* set MAC hardware address length */
   netif->hwaddr_len = ETH_HWADDR_LEN;
@@ -192,20 +195,32 @@ static void low_level_init(struct netif *netif)
 
   /* create a binary semaphore used for informing ethernetif of frame transmission */
   TxPktSemaphore = xSemaphoreCreateBinary();
+  if ((RxPktSemaphore == NULL) || (TxPktSemaphore == NULL))
+  {
+    return ERR_MEM;
+  }
 
   /* create the task that handles the ETH_MAC */
   osThreadDef(EthIf, ethernetif_input, osPriorityRealtime, 0, INTERFACE_THREAD_STACK_SIZE);
-  osThreadCreate (osThread(EthIf), netif);
+  EthIfThread = osThreadCreate(osThread(EthIf), netif);
+  if (EthIfThread == NULL)
+  {
+    return ERR_MEM;
+  }
 
   /* Set PHY IO functions */
-  LAN8742_RegisterBusIO(&LAN8742, &LAN8742_IOCtx);
+  if (LAN8742_RegisterBusIO(&LAN8742, &LAN8742_IOCtx) !=
+      LAN8742_STATUS_OK)
+  {
+    return ERR_IF;
+  }
 
   /* Initialize the LAN8742 ETH PHY */
   if(LAN8742_Init(&LAN8742) != LAN8742_STATUS_OK)
   {
     netif_set_link_down(netif);
     netif_set_down(netif);
-    return;
+    return ERR_IF;
   }
 
   PHYLinkState = LAN8742_GetLinkState(&LAN8742);
@@ -247,7 +262,10 @@ static void low_level_init(struct netif *netif)
     MACConf.DuplexMode = duplex;
     MACConf.Speed = speed;
     HAL_ETH_SetMACConfig(&EthHandle, &MACConf);
-    HAL_ETH_Start_IT(&EthHandle);
+    if (HAL_ETH_Start_IT(&EthHandle) != HAL_OK)
+    {
+      return ERR_IF;
+    }
     netif_set_up(netif);
     netif_set_link_up(netif);
   }
@@ -258,8 +276,12 @@ static void low_level_init(struct netif *netif)
       This thread will keep resetting the RMII interface until good frames are received
     */
     osThreadDef(RMII_Watchdog, RMII_Thread, osPriorityRealtime, 0, configMINIMAL_STACK_SIZE);
-    osThreadCreate (osThread(RMII_Watchdog), NULL);
+    if (osThreadCreate(osThread(RMII_Watchdog), NULL) == NULL)
+    {
+      return ERR_MEM;
+    }
   }
+  return ERR_OK;
 }
 
 /**
@@ -427,9 +449,7 @@ err_t ethernetif_init(struct netif *netif)
   netif->linkoutput = low_level_output;
 
   /* initialize the hardware */
-  low_level_init(netif);
-
-  return ERR_OK;
+  return low_level_init(netif);
 }
 
 /**
@@ -641,6 +661,7 @@ void ethernet_link_thread( void const * argument )
 
     if(netif_is_link_up(netif) && (PHYLinkState <= LAN8742_STATUS_LINK_DOWN))
     {
+      (void)netifapi_dhcp_stop(netif);
       HAL_ETH_Stop_IT(&EthHandle);
       netifapi_netif_set_down(netif);
       netifapi_netif_set_link_down(netif);
@@ -683,6 +704,8 @@ void ethernet_link_thread( void const * argument )
         HAL_ETH_Start_IT(&EthHandle);
         netifapi_netif_set_up(netif);
         netifapi_netif_set_link_up(netif);
+        (void)netifapi_dhcp_stop(netif);
+        (void)netifapi_dhcp_start(netif);
       }
     }
 
