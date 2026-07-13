@@ -74,10 +74,19 @@
 #define APP_RECORD_TEXT_LENGTH        32U
 #define APP_TOUCH_DEBOUNCE_MS        200U
 #define APP_HISTORY_SWIPE_PIXELS       35U
-#define APP_DELETE_X                  290U
-#define APP_DELETE_Y                  220U
-#define APP_DELETE_WIDTH              180U
-#define APP_DELETE_HEIGHT              48U
+#define APP_VARIABLE_SWIPE_PIXELS      25U
+#define APP_VARIABLE_TAP_MOVE_PIXELS   12U
+#define APP_VARIABLE_MIN_ML            10U
+#define APP_VARIABLE_MAX_ML           990U
+#define APP_VARIABLE_STEP_ML           10U
+#define APP_VARIABLE_X                290U
+#define APP_VARIABLE_Y                216U
+#define APP_VARIABLE_WIDTH             84U
+#define APP_VARIABLE_HEIGHT            52U
+#define APP_DELETE_X                  386U
+#define APP_DELETE_Y                  216U
+#define APP_DELETE_WIDTH               84U
+#define APP_DELETE_HEIGHT              52U
 #define APP_MAIN_MENU_X               205U
 #define APP_MAIN_MENU_Y                 3U
 #define APP_MAIN_MENU_WIDTH            65U
@@ -276,6 +285,7 @@ static volatile uint32_t appStorageStatusVersion = 0U;
 static volatile uint8_t appStorageWriteStage = 0U;
 static volatile uint8_t appSdRemovalSeen = 0U;
 static uint32_t appTodayTotalMl = 0U;
+static uint16_t appVariableAmountMl = 150U;
 
 static uint16_t appTodayYear = 0U;
 static uint8_t appTodayMonth = 0U;
@@ -367,6 +377,7 @@ static void APP_DrawLeftPanel(void);
 static void APP_DrawCurrentTime(uint8_t force);
 static void APP_DrawSdStatus(uint8_t force);
 static void APP_DrawMainMenuButton(void);
+static void APP_DrawVariableMilkButton(uint8_t pressed);
 
 static void APP_DrawMilkButton(
     uint8_t buttonIndex,
@@ -1560,6 +1571,7 @@ static void APP_DrawInterface(void)
 
     APP_DrawLeftPanel();
     APP_DrawAllMilkButtons();
+    APP_DrawVariableMilkButton(0U);
     APP_DrawDeleteButton();
 
     APP_DrawCurrentTime(1U);
@@ -1878,11 +1890,41 @@ static void APP_DrawDeleteButton(void)
     BSP_LCD_SetTextColor(color);
     BSP_LCD_FillRect(APP_DELETE_X, APP_DELETE_Y,
                      APP_DELETE_WIDTH, APP_DELETE_HEIGHT);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_DrawRect(APP_DELETE_X, APP_DELETE_Y,
+                     APP_DELETE_WIDTH, APP_DELETE_HEIGHT);
     BSP_LCD_SetFont(&Font16);
     BSP_LCD_SetBackColor(color);
     BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-    BSP_LCD_DisplayStringAt(APP_DELETE_X + 57U, APP_DELETE_Y + 15U,
+    BSP_LCD_DisplayStringAt(APP_DELETE_X + 9U, APP_DELETE_Y + 18U,
                             (uint8_t *)"DELETE", LEFT_MODE);
+}
+
+static void APP_DrawVariableMilkButton(uint8_t pressed)
+{
+    char label[8];
+    uint16_t textWidth;
+    uint16_t textX;
+    uint32_t color = (pressed != 0U) ?
+        LCD_COLOR_DARKBLUE : LCD_COLOR_BLUE;
+
+    snprintf(label, sizeof(label), "%uml",
+             (unsigned int)appVariableAmountMl);
+    textWidth = (uint16_t)(strlen(label) * Font16.Width);
+    textX = APP_VARIABLE_X +
+        ((APP_VARIABLE_WIDTH - textWidth) / 2U);
+
+    BSP_LCD_SetTextColor(color);
+    BSP_LCD_FillRect(APP_VARIABLE_X, APP_VARIABLE_Y,
+                     APP_VARIABLE_WIDTH, APP_VARIABLE_HEIGHT);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_DrawRect(APP_VARIABLE_X, APP_VARIABLE_Y,
+                     APP_VARIABLE_WIDTH, APP_VARIABLE_HEIGHT);
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(color);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_DisplayStringAt(textX, APP_VARIABLE_Y + 18U,
+                            (uint8_t *)label, LEFT_MODE);
 }
 
 static void APP_DrawMilkButton(
@@ -2537,6 +2579,11 @@ static void APP_ProcessTouch(void)
     static uint8_t historyTouchActive = 0U;
     static uint16_t historyTouchStartY = 0U;
     static uint16_t historyTouchLastY = 0U;
+    static uint8_t variableTouchActive = 0U;
+    static uint16_t variableTouchStartX = 0U;
+    static uint16_t variableTouchStartY = 0U;
+    static uint16_t variableTouchLastX = 0U;
+    static uint16_t variableTouchLastY = 0U;
 
     uint8_t touching;
     uint8_t i;
@@ -2629,6 +2676,20 @@ static void APP_ProcessTouch(void)
                 }
             }
 
+            if (APP_PointInRect(touchX, touchY,
+                                APP_VARIABLE_X, APP_VARIABLE_Y,
+                                APP_VARIABLE_WIDTH,
+                                APP_VARIABLE_HEIGHT) != 0U)
+            {
+                appLastPressTick = currentTick;
+                variableTouchActive = 1U;
+                variableTouchStartX = touchX;
+                variableTouchStartY = touchY;
+                variableTouchLastX = touchX;
+                variableTouchLastY = touchY;
+                APP_DrawVariableMilkButton(1U);
+            }
+
             for (i = 0U;
                  i < APP_MILK_BUTTON_COUNT;
                  i++)
@@ -2660,6 +2721,11 @@ static void APP_ProcessTouch(void)
     {
         historyTouchLastY = appTouchState.touchY[0];
     }
+    if ((touching != 0U) && (variableTouchActive != 0U))
+    {
+        variableTouchLastX = appTouchState.touchX[0];
+        variableTouchLastY = appTouchState.touchY[0];
+    }
 
     /*
      * 手指松开。
@@ -2667,6 +2733,45 @@ static void APP_ProcessTouch(void)
     if ((touching == 0U) &&
         (previousTouching != 0U))
     {
+        if (variableTouchActive != 0U)
+        {
+            int32_t deltaX = (int32_t)variableTouchLastX -
+                             (int32_t)variableTouchStartX;
+            int32_t deltaY = (int32_t)variableTouchLastY -
+                             (int32_t)variableTouchStartY;
+            int32_t absoluteX = (deltaX < 0) ? -deltaX : deltaX;
+            int32_t absoluteY = (deltaY < 0) ? -deltaY : deltaY;
+
+            if ((deltaX >= (int32_t)APP_VARIABLE_SWIPE_PIXELS) &&
+                (absoluteX > absoluteY))
+            {
+                if (appVariableAmountMl <=
+                    (APP_VARIABLE_MAX_ML - APP_VARIABLE_STEP_ML))
+                {
+                    appVariableAmountMl += APP_VARIABLE_STEP_ML;
+                }
+            }
+            else if ((deltaX <= -(int32_t)APP_VARIABLE_SWIPE_PIXELS) &&
+                     (absoluteX > absoluteY))
+            {
+                if (appVariableAmountMl >=
+                    (APP_VARIABLE_MIN_ML + APP_VARIABLE_STEP_ML))
+                {
+                    appVariableAmountMl -= APP_VARIABLE_STEP_ML;
+                }
+            }
+            else if ((absoluteX <=
+                      (int32_t)APP_VARIABLE_TAP_MOVE_PIXELS) &&
+                     (absoluteY <=
+                      (int32_t)APP_VARIABLE_TAP_MOVE_PIXELS))
+            {
+                APP_AddMilkRecord(appVariableAmountMl);
+            }
+
+            APP_DrawVariableMilkButton(0U);
+            variableTouchActive = 0U;
+        }
+
         if (historyTouchActive != 0U)
         {
             int32_t swipe = (int32_t)historyTouchStartY -
