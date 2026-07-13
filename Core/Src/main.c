@@ -60,8 +60,8 @@
 #define APP_MILK_BUTTON_X2           386U
 
 #define APP_MILK_BUTTON_Y1            30U
-#define APP_MILK_BUTTON_Y2           105U
-#define APP_MILK_BUTTON_Y3           180U
+#define APP_MILK_BUTTON_Y2            95U
+#define APP_MILK_BUTTON_Y3           160U
 
 #define APP_RECORD_X                  10U
 #define APP_RECORD_Y                  88U
@@ -75,9 +75,13 @@
 #define APP_TOUCH_DEBOUNCE_MS        200U
 #define APP_HISTORY_SWIPE_PIXELS       35U
 #define APP_DELETE_X                  290U
-#define APP_DELETE_Y                  240U
+#define APP_DELETE_Y                  220U
 #define APP_DELETE_WIDTH              180U
-#define APP_DELETE_HEIGHT              28U
+#define APP_DELETE_HEIGHT              48U
+#define APP_MAIN_MENU_X               205U
+#define APP_MAIN_MENU_Y                 3U
+#define APP_MAIN_MENU_WIDTH            65U
+#define APP_MAIN_MENU_HEIGHT           24U
 #define APP_MENU_BUTTON_WIDTH         190U
 #define APP_MENU_BUTTON_HEIGHT         65U
 #define APP_MENU_LEFT_X                30U
@@ -362,6 +366,7 @@ static void APP_DrawInterface(void);
 static void APP_DrawLeftPanel(void);
 static void APP_DrawCurrentTime(uint8_t force);
 static void APP_DrawSdStatus(uint8_t force);
+static void APP_DrawMainMenuButton(void);
 
 static void APP_DrawMilkButton(
     uint8_t buttonIndex,
@@ -1701,7 +1706,6 @@ static void APP_DrawLeftPanel(void)
     uint8_t displayDay = appTodayDay;
     uint32_t displayTotal = 0U;
     uint16_t displayFeeds = 0U;
-    uint16_t displayPending = 0U;
     const APP_MilkRecordTypeDef *displayLast = NULL;
 
     APP_GetHistoryPageRange(&firstIndex, &endIndex, &totalPages);
@@ -1729,10 +1733,6 @@ static void APP_DrawLeftPanel(void)
             {
                 displayTotal += appMilkRecords[j].amountMl;
                 displayFeeds++;
-                if (appMilkRecords[j].pending != 0U)
-                {
-                    displayPending++;
-                }
                 displayLast = &appMilkRecords[j];
             }
         }
@@ -1773,10 +1773,9 @@ static void APP_DrawLeftPanel(void)
     snprintf(
         text,
         sizeof(text),
-        "Total:%lu ml F:%u P:%u",
+        "Total:%lu ml Feed:%u",
         (unsigned long)displayTotal,
-        (unsigned int)displayFeeds,
-        (unsigned int)displayPending
+        (unsigned int)displayFeeds
     );
 
     BSP_LCD_DisplayStringAt(
@@ -1844,6 +1843,27 @@ static void APP_DrawLeftPanel(void)
     }
 
     BSP_LCD_SetBackColor(LCD_COLOR_WHITE);
+    APP_DrawMainMenuButton();
+}
+
+static void APP_DrawMainMenuButton(void)
+{
+    uint8_t canOpen =
+        ((appPendingCount == 0U) && (appStorageFault == 0U)) ? 1U : 0U;
+    uint32_t color = (canOpen != 0U) ? LCD_COLOR_BLUE : LCD_COLOR_GRAY;
+
+    BSP_LCD_SetTextColor(color);
+    BSP_LCD_FillRect(APP_MAIN_MENU_X, APP_MAIN_MENU_Y,
+                     APP_MAIN_MENU_WIDTH, APP_MAIN_MENU_HEIGHT);
+    BSP_LCD_SetTextColor(LCD_COLOR_BLACK);
+    BSP_LCD_DrawRect(APP_MAIN_MENU_X, APP_MAIN_MENU_Y,
+                     APP_MAIN_MENU_WIDTH, APP_MAIN_MENU_HEIGHT);
+    BSP_LCD_SetFont(&Font16);
+    BSP_LCD_SetBackColor(color);
+    BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
+    BSP_LCD_DisplayStringAt(APP_MAIN_MENU_X + 10U,
+                            APP_MAIN_MENU_Y + 4U,
+                            (uint8_t *)"MENU", LEFT_MODE);
 }
 
 static void APP_DrawDeleteButton(void)
@@ -1861,7 +1881,7 @@ static void APP_DrawDeleteButton(void)
     BSP_LCD_SetFont(&Font16);
     BSP_LCD_SetBackColor(color);
     BSP_LCD_SetTextColor(LCD_COLOR_WHITE);
-    BSP_LCD_DisplayStringAt(APP_DELETE_X + 57U, APP_DELETE_Y + 5U,
+    BSP_LCD_DisplayStringAt(APP_DELETE_X + 57U, APP_DELETE_Y + 15U,
                             (uint8_t *)"DELETE", LEFT_MODE);
 }
 
@@ -2544,7 +2564,11 @@ static void APP_ProcessTouch(void)
         touchX = appTouchState.touchX[0];
         touchY = appTouchState.touchY[0];
 
-        if (touchX < APP_SEPARATOR_X)
+        if ((touchX < APP_SEPARATOR_X) &&
+            (APP_PointInRect(touchX, touchY,
+                             APP_MAIN_MENU_X, APP_MAIN_MENU_Y,
+                             APP_MAIN_MENU_WIDTH,
+                             APP_MAIN_MENU_HEIGHT) == 0U))
         {
             historyTouchActive = 1U;
             historyTouchStartY = touchY;
@@ -2556,6 +2580,36 @@ static void APP_ProcessTouch(void)
         if ((currentTick - appLastPressTick) >=
             APP_TOUCH_DEBOUNCE_MS)
         {
+            if ((appPendingCount == 0U) &&
+                (appStorageFault == 0U) &&
+                (APP_PointInRect(touchX, touchY,
+                                 APP_MAIN_MENU_X, APP_MAIN_MENU_Y,
+                                 APP_MAIN_MENU_WIDTH,
+                                 APP_MAIN_MENU_HEIGHT) != 0U))
+            {
+                TS_StateTypeDef releaseState = {0};
+
+                appLastPressTick = currentTick;
+                historyTouchActive = 0U;
+                activeButtonIndex = -1;
+                APP_BootMenu();
+
+                /* START returns on touch-down; consume that touch so it
+                   cannot select a history row on the redrawn main screen. */
+                do
+                {
+                    (void)BSP_TS_GetState(&releaseState);
+                    osDelay(20U);
+                } while (releaseState.touchDetected > 0U);
+
+                APP_InitTodayState();
+                (void)APP_LoadTodayRecords();
+                APP_DrawInterface();
+                appLastPressTick = HAL_GetTick();
+                previousTouching = 0U;
+                return;
+            }
+
             if ((appSelectedRecordIndex >= 0) &&
                 (appMilkRecords[appSelectedRecordIndex].pending == 0U) &&
                 (appPendingCount == 0U) &&
